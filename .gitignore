@@ -1,0 +1,13 @@
+/target
+
+# Your data: feeds, history, settings (when TN_DATA_DIR points here).
+.env
+.tuinews/
+
+# Local AI tool folders: never committed or published.
+/.agents/
+/.claude/
+/skills-lock.json
+
+# macOS folder settings.
+.DS_Store

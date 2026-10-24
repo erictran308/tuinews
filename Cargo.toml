@@ -1,0 +1,58 @@
+[package]
+name = "tuinews"
+version = "0.1.0"
+edition = "2024"
+description = "The news in your terminal: a vim-style RSS reader with a sidebar of sources and a grid of article cards"
+license = "MIT"
+repository = "https://github.com/erictran308/tuinews"
+readme = "README.md"
+rust-version = "1.90"
+keywords = ["rss", "news", "tui", "terminal", "vim"]
+categories = ["command-line-utilities"]
+# What goes into the published crate, and nothing else.
+include = ["src/**/*.rs", "themes/*.toml", "README.md", "LICENSE", "SECURITY.md", "Cargo.toml", "Cargo.lock"]
+
+[[bin]]
+name = "tuinews"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+arboard = { version = "3.6.1", default-features = false }
+chrono = "0.4.45"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+dirs = "7.0.0"
+dotenvy = "0.15.7"
+# The tree scraper parses HTML into, to walk an article's page.
+ego-tree = "0.11"
+# Feeds declared in another encoding than UTF-8 (UTF-16, windows-1258).
+encoding_rs = "0.8.35"
+futures = "0.3.34"
+# Pure-Rust decoders for the formats news sites serve pictures in, and
+# nothing else: no AVIF (libdav1d, C), whose pictures are asked for as
+# the JPEG beside them (`images::usable_url`).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+open = { version = "5.4.4", features = ["shellexecute-on-windows"] }
+quick-xml = "0.42"
+ratatui = "0.30.2"
+ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
+# rustls with ring for its cryptography: aws-lc-rs, reqwest's default, needs
+# NASM to build on Windows. Feeds and pages come compressed.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "gzip", "brotli", "deflate"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+# SHA-256 for an article's id: the ring rustls already builds.
+ring = "0.17.14"
+rusqlite = { version = "0.40", features = ["bundled"] }
+# HTML: feeds' summaries, and an article's text from its page.
+scraper = { version = "0.29", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+# The animations (ui/effects.rs), on ratatui's own core, without its DSL.
+tachyonfx = { version = "0.25.2", default-features = false, features = ["std", "std-duration"] }
+tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.6"
+unicode-normalization = "0.1.24"
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

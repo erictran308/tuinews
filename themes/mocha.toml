@@ -1,0 +1,25 @@
+# Catppuccin Mocha, tuinews's default theme: https://catppuccin.com/palette
+#
+# The same sixteen-color palettes as tuitube, tuigram and tuimeta. The
+# settings (O) pick one; settings.toml keeps the one picked.
+
+name = "Catppuccin Mocha"
+
+# What tuinews paints with each. Colors are "#rrggbb".
+[palette]
+bg = "#1e1e2e"       # the background
+bg_alt = "#181825"   # the sidebar, the search box and popups
+surface = "#313244"  # the selected row, a card's words, a picture still loading
+overlay = "#6c7086"  # borders of what doesn't have the keys, the ring of a card when the sidebar has them
+comment = "#7f849c"  # key hints, summaries, placeholders
+subtext = "#a6adc8"  # sources and ages, titles of articles read
+fg = "#cdd6f4"       # titles and text
+red = "#f38ba8"      # errors, the logo, the dot of an unread article, a source's color
+orange = "#fab387"   # a source's color
+yellow = "#f9e2af"   # warnings, a source's color
+green = "#a6e3a1"    # what worked, a source's color
+cyan = "#94e2d5"     # a source's color
+blue = "#89b4fa"     # a source's color
+purple = "#cba6f7"   # a source's color
+pink = "#f5c2e7"     # (tuigram's names in groups; unused here)
+accent = "#b4befe"   # what has the keys: the selected card's ring, the cursor, popups, headings in articles
