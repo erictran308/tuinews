@@ -71,7 +71,9 @@ pub enum AppEvent {
         into: Option<CategoryId>,
         result: Result<(String, feed::Feed)>,
     },
-    /// SIGHUP or SIGTERM: quit as `q` does.
+    /// SIGHUP or SIGTERM: quit as `q` does. Unix's only: nothing sends it
+    /// on Windows.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Quit,
 }
 
