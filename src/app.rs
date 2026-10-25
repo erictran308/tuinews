@@ -1582,11 +1582,10 @@ impl App {
         for event in events.into_iter().filter(|e| !matches!(e, Event::Key(_))) {
             self.on_terminal(event);
         }
-        let typed = |key: &KeyEvent| typed::types(key);
         let text: String = presses
             .iter()
             .filter_map(|key| match key.code {
-                KeyCode::Char(c) if typed(key) => Some(c),
+                KeyCode::Char(c) if typed::types(key) => Some(c),
                 _ => None,
             })
             .collect();
@@ -1620,7 +1619,7 @@ impl App {
         // A key that edits (Backspace, an arrow, Esc) is no paste's: it's
         // typing that came all at once (a slow link), so the keys run as
         // typed, and nothing once the box closes.
-        let edits = |key: &KeyEvent| !typed(key) && key.code != KeyCode::Enter;
+        let edits = |key: &KeyEvent| !typed::types(key) && key.code != KeyCode::Enter;
         if presses.iter().any(edits) {
             for key in presses {
                 if !self.typing() {
@@ -1631,7 +1630,7 @@ impl App {
             return;
         }
         let (last, before) = presses.split_last().expect("two or more");
-        let submit = last.code == KeyCode::Enter && before.iter().all(typed);
+        let submit = last.code == KeyCode::Enter && before.iter().all(typed::types);
         self.on_terminal(Event::Paste(text));
         if submit {
             self.on_key(*last);
@@ -1653,13 +1652,13 @@ impl App {
             Event::Key(key) => self.on_key(key),
             Event::Paste(text) => {
                 // Cut before cleaning, so a huge paste costs nothing.
-                let cut = text::first_chars(&text, 2 * MAX_PROMPT);
-                let line = article::one_line(cut, MAX_PROMPT);
+                let clean = text::clean(text::first_chars(&text, 2 * MAX_PROMPT));
+                let line = article::one_line(&clean, MAX_PROMPT);
                 // In a box, a space it had at either end is kept where a word
-                // next to it would run into it otherwise.
+                // would run into it otherwise.
                 let spaced = (
-                    cut.starts_with(char::is_whitespace),
-                    cut.ends_with(char::is_whitespace),
+                    clean.starts_with(char::is_whitespace),
+                    clean.ends_with(char::is_whitespace),
                 );
                 if let Some(prompt) = self.prompt.as_mut() {
                     prompt.typed.paste(&line, spaced, MAX_PROMPT);
@@ -1778,7 +1777,7 @@ impl App {
             }
             KeyCode::Enter => {
                 let prompt = self.prompt.take().expect("open");
-                let typed = prompt.typed.text().trim().to_string();
+                let typed = prompt.typed.into_text().trim().to_string();
                 if typed.is_empty() {
                     return;
                 }

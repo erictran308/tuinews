@@ -331,6 +331,14 @@ fn with_cursor(typed: &Typed, room: usize, c: &Colors) -> Vec<Span<'static>> {
         Some(letter) => (letter, &after[letter.len()..]),
         None => (" ", ""),
     };
+    // A letter wider than the whole box, or one taking no column (an accent
+    // with no letter), shows as a block alone.
+    let width = cells(under);
+    let under = if width == 0 || width > room + 1 {
+        " "
+    } else {
+        under
+    };
     let room = (room + 1).saturating_sub(cells(under));
     let before = tail(before, room.saturating_sub(cells(after).min(room / 2)));
     let after = head(after, room.saturating_sub(cells(before)));
@@ -480,10 +488,10 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
         (_, Some(prompt)) => {
             let keys = match prompt.kind {
                 PromptKind::Search => {
-                    " `Enter` search · `Ctrl-j` articles · `Esc` cancel · `Ctrl-u` clear · without accents finds them too · `←→` move"
+                    " `Enter` search · `Ctrl-j` articles · `Esc` cancel · `Ctrl-u` delete before · without accents finds them too · `←→` move"
                 }
                 PromptKind::AddFeed => {
-                    " Type or paste a feed's address, or a site's · `Enter` add · `Esc` cancel · `Ctrl-u` clear · `←→` move"
+                    " Type or paste a feed's address, or a site's · `Enter` add · `Esc` cancel · `Ctrl-u` delete before · `←→` move"
                 }
             };
             hints_fitting(keys, room, c)
@@ -568,8 +576,8 @@ const HELP: [(&str, &str); 33] = [
     ("Esc  q  Backspace", "back to the articles"),
     ("", ""),
     ("In a box you type in", ""),
-    ("←→  Option ←→", "move a letter, a word"),
-    ("Home End  Cmd ←→", "to either end"),
+    ("←→  Alt or Option ←→", "move a letter, a word"),
+    ("Home End  Ctrl-a Ctrl-e", "to either end (Cmd ←→)"),
     ("Backspace  Delete", "delete the letter before, after"),
     ("Ctrl-w  Ctrl-u", "delete the word before, all before"),
     ("", ""),
