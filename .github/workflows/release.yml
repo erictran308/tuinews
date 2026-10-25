@@ -1,8 +1,12 @@
-# Ready-made tuinews for macOS, Linux and Windows, built when a version's tag
-# (v0.2.0) is pushed, or by hand for a tag already there (Actions → Release →
-# Run workflow), and put on that tag's GitHub release with a SHA256SUMS file.
-# The builds can't write anything: only the last job, which builds nothing,
-# may change the release.
+# Builds tuinews for every platform. Pushing a version tag (v0.2.0) attaches
+# the binaries, their SHA-256 sums and a signed provenance attestation to a
+# GitHub release; running it by hand only builds them, as artifacts of the
+# run.
+#
+# As tuitube's, but Linux's are built with musl: static, they run on any
+# distribution. Actions are pinned to commits, since they make the release
+# files, nothing is cached between runs, and only the release job can write
+# to the repository.
 
 name: Release
 
@@ -10,88 +14,198 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "The tag to build, e.g. v0.1.0"
-        required: true
 
 permissions:
   contents: read
 
-env:
-  TAG: ${{ inputs.tag || github.ref_name }}
-  # Smaller downloads: the symbols stay out.
-  CARGO_PROFILE_RELEASE_STRIP: "true"
-
 jobs:
+  check:
+    name: Format, lints and tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
   build:
     name: ${{ matrix.target }}
+    needs: check
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-apple-darwin, os: macos-latest }
-          - { target: x86_64-apple-darwin, os: macos-latest }
-          # musl: one binary with nothing to link, for any Linux.
-          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04 }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04-arm }
-          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          # musl: one static binary, with nothing of the system's to link.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            run: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04-arm
+            run: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            run: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            run: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            run: true
+          # Built on ARM64 Windows itself: ring's assembly for it needs
+          # clang, which the step below makes sure of.
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            run: true
+    env:
+      EXE: ${{ startsWith(matrix.os, 'windows') && '.exe' || '' }}
+      # Windows binaries carry the C runtime, so nobody needs the Visual C++
+      # redistributable.
+      RUSTFLAGS: ${{ startsWith(matrix.os, 'windows') && '-C target-feature=+crt-static' || '' }}
     steps:
+      # Without the token left in .git/config, build scripts can't push.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ env.TAG }}
           persist-credentials: false
+
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-      - if: contains(matrix.target, 'musl')
+
+      # musl-gcc compiles the C in tuinews (SQLite, ring) for musl.
+      - name: Install musl's tools
+        if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Make sure clang is there (ring on ARM64 Windows)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        # The image's own LLVM (it lists one) when it's there; otherwise one
+        # exact version of Chocolatey's llvm package, whose script checks the
+        # official installer's SHA-256, never whatever version is newest.
+        # clang compiles ring's C and assembly into the released binary, so
+        # its version goes in the log.
+        run: |
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+            if (-not (Test-Path "$llvm\clang.exe")) {
+              choco install llvm --version=22.1.8 -y --no-progress
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            $llvm | Out-File -FilePath $env:GITHUB_PATH -Append
+            $env:PATH = "$llvm;$env:PATH"
+          }
+          clang --version
+
+      # The tests run where the binary can: the same build, checked.
+      - name: Test
+        if: matrix.run
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Binaries built for another architecture can't run here; the native
+      # ones show the build works.
+      - name: Check the binary runs
+        if: matrix.run
+        shell: bash
+        run: |
+          bin=target/${{ matrix.target }}/release/tuinews$EXE
+          "$bin" --version
+          # Captured first: with pipefail, grep -q closing the pipe early
+          # would count as a failure of the binary.
+          help=$("$bin" --help)
+          grep -q "The news in your terminal" <<< "$help"
+
+      - name: Show that it links nothing
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          info=$(file target/${{ matrix.target }}/release/tuinews)
+          echo "$info"
+          grep -q "static" <<< "$info"
+
+      # Asset names have no version, so the README can link to
+      # releases/latest/download/<name>.
       - name: Package
         shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
         run: |
-          name="tuinews-$TAG-$TARGET"
-          mkdir -p "dist/$name"
-          cp README.md LICENSE "dist/$name/"
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/tuinews$EXE" README.md LICENSE SECURITY.md dist/
           cd dist
-          if [ "$RUNNER_OS" = Windows ]; then
-            cp "../target/$TARGET/release/tuinews.exe" "$name/"
-            7z a "$name.zip" "$name" > /dev/null
+          if [ "${{ runner.os }}" = Windows ]; then
+            7z a ../tuinews-${{ matrix.target }}.zip tuinews.exe README.md LICENSE SECURITY.md
           else
-            cp "../target/$TARGET/release/tuinews" "$name/"
-            tar czf "$name.tar.gz" "$name"
+            tar czf ../tuinews-${{ matrix.target }}.tar.gz tuinews README.md LICENSE SECURITY.md
           fi
-          rm -r "$name"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ${{ matrix.target }}
-          path: dist/*
+          name: tuinews-${{ matrix.target }}
+          path: tuinews-${{ matrix.target }}.*
           if-no-files-found: error
 
   release:
-    name: Release
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # For the signed provenance attestation.
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
           merge-multiple: true
-      - name: Upload to the release
+
+      # Made before the attestation, so the sums are attested too.
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum tuinews-* > SHA256SUMS
+
+      # Lets anyone check a download was built here, from this commit:
+      # gh attestation verify <file> --repo erictran308/tuinews
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: |
+            dist/tuinews-*
+            dist/SHA256SUMS
+
+      # The notes are the tag's message (git tag -a vX.Y.Z -F notes.md), and
+      # GitHub adds a link to the full list of changes after them. A tag
+      # without a message just gets the link.
+      - name: Release notes
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
         run: |
-          cd dist
-          sha256sum tuinews-* > SHA256SUMS
-          cat SHA256SUMS
-          if ! gh release view "$TAG" > /dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --title "tuinews ${TAG#v}" --generate-notes
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+            --jq '.object.type + " " + .object.sha')
+          touch notes.md
+          if [ "${ref%% *}" = tag ]; then
+            gh api "repos/$GITHUB_REPOSITORY/git/tags/${ref#* }" --jq .message > notes.md
           fi
-          gh release upload "$TAG" tuinews-* SHA256SUMS --clobber
+          # `git tag -a vX.Y.Z -m vX.Y.Z` has only the version for a message.
+          if [ "$(tr -d '[:space:]' < notes.md)" = "$GITHUB_REF_NAME" ]; then
+            : > notes.md
+          fi
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --title "$GITHUB_REF_NAME"
+          --notes-file notes.md
+          --generate-notes

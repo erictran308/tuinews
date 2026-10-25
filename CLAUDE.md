@@ -20,7 +20,7 @@ cargo clippy --all-targets       # keep it warning-free
 cargo fmt
 ```
 
-Releasing: the version in `Cargo.toml`, CI green on `main`, `cargo publish --locked` (with `CARGO_TARGET_DIR` set elsewhere: a `target/package` build leaves later ones stale), then a tag `vX.Y.Z` pushed. The tag starts `.github/workflows/release.yml`: it builds tuinews for macOS (ARM, Intel), Linux (musl, x86_64 and ARM) and Windows, with jobs that can't write, then one that can makes the GitHub release if there's none and puts the archives and `SHA256SUMS` on it. Run it by hand (Actions → Release, a tag) to build for a tag again.
+Release binaries are built only by `.github/workflows/release.yml` (pushing a `v*` tag), as tuitube's are: six targets (Linux with musl, static, for any distribution; macOS; Windows with a static C runtime; x86_64 and ARM64 each), tests run on the native ones, then the GitHub release gets the archives, `SHA256SUMS` and a provenance attestation covering both, with the tag's message for notes (`git tag -a vX.Y.Z -F notes.md`). `cargo binstall tuinews` takes those archives (`[package.metadata.binstall]` in `Cargo.toml`), so asset names and the `v<version>` tag must stay as `pkg-url` expects, and the release must be up before `cargo publish` (run with `CARGO_TARGET_DIR` set elsewhere: a `target/package` build leaves later ones stale). Running the workflow by hand only builds, as the run's artifacts.
 
 ## Security
 

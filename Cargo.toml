@@ -1,6 +1,6 @@
 [package]
 name = "tuinews"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "The news in your terminal: a vim-style RSS reader with a sidebar of sources and a grid of article cards"
 license = "MIT"
@@ -15,6 +15,24 @@ include = ["src/**/*.rs", "themes/*.toml", "testdata/*.xml", "README.md", "LICEN
 [[bin]]
 name = "tuinews"
 path = "src/main.rs"
+
+# `cargo binstall tuinews` takes the binary from the GitHub release, built by
+# .github/workflows/release.yml; without one for the computer, it builds from
+# source. QuickInstall's binaries, which aren't built here, are never used.
+# On Linux it looks for the gnu build first, then takes the musl one.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/tuinews-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "tuinews{ binary-ext }"
+disabled-strategies = ["quick-install"]
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/tuinews-{ target }.zip"
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/tuinews-{ target }.zip"
+pkg-fmt = "zip"
 
 [dependencies]
 anyhow = "1.0.104"

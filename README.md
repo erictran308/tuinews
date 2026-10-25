@@ -38,16 +38,37 @@ Arrow keys or vim keys. No account, no tracking, nothing but the feeds you read.
 
 ## Get started
 
-**1. Install it.** Download it ready-made from the [latest release](https://github.com/erictran308/tuinews/releases/latest): `aarch64-apple-darwin` for a Mac with Apple silicon, `x86_64-apple-darwin` for an Intel one, `x86_64-unknown-linux-musl` for any Linux (`aarch64-unknown-linux-musl` on ARM), `x86_64-pc-windows-msvc` for Windows. `SHA256SUMS` beside them says what each should hash to. Unpack it and put `tuinews` in a folder on your `PATH`:
+**1. Install it.** If you have Rust and [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), that's one command, on any system:
 
 ```sh
-tar xzf tuinews-*-aarch64-apple-darwin.tar.gz
-mv tuinews-*-aarch64-apple-darwin/tuinews ~/.local/bin/
+cargo binstall tuinews
 ```
 
-On Windows, unzip it and put `tuinews.exe` in a folder on your `PATH`. If macOS won't open it because it can't check it (tuinews isn't signed by Apple), let it: `xattr -d com.apple.quarantine ~/.local/bin/tuinews`.
+Otherwise, on macOS or Linux, paste this into a terminal. It puts `tuinews` in `~/.local/bin`:
 
-Or build it with Cargo. You need Rust 1.90 or newer ([rustup.rs](https://rustup.rs)) and a C compiler, for the SQLite and TLS code built into tuinews: `xcode-select --install` on macOS, `build-essential` (or your system's `gcc`) on Linux, the Visual Studio Build Tools that rustup offers on Windows. Then:
+```sh
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/erictran308/tuinews/releases/latest/download/tuinews-aarch64-apple-darwin.tar.gz | tar xz -C ~/.local/bin tuinews
+```
+
+Swap the file name for your computer's:
+
+| Computer | File |
+| --- | --- |
+| Mac with Apple silicon (M1 or later) | [`tuinews-aarch64-apple-darwin.tar.gz`](https://github.com/erictran308/tuinews/releases/latest/download/tuinews-aarch64-apple-darwin.tar.gz) |
+| Mac with Intel | [`tuinews-x86_64-apple-darwin.tar.gz`](https://github.com/erictran308/tuinews/releases/latest/download/tuinews-x86_64-apple-darwin.tar.gz) |
+| Linux, x86_64 | [`tuinews-x86_64-unknown-linux-musl.tar.gz`](https://github.com/erictran308/tuinews/releases/latest/download/tuinews-x86_64-unknown-linux-musl.tar.gz) |
+| Linux, ARM64 | [`tuinews-aarch64-unknown-linux-musl.tar.gz`](https://github.com/erictran308/tuinews/releases/latest/download/tuinews-aarch64-unknown-linux-musl.tar.gz) |
+| Windows, x86_64 | [`tuinews-x86_64-pc-windows-msvc.zip`](https://github.com/erictran308/tuinews/releases/latest/download/tuinews-x86_64-pc-windows-msvc.zip) |
+| Windows, ARM64 | [`tuinews-aarch64-pc-windows-msvc.zip`](https://github.com/erictran308/tuinews/releases/latest/download/tuinews-aarch64-pc-windows-msvc.zip) |
+
+- **Windows:** download the `.zip`, unzip it, and run `tuinews.exe` from Windows Terminal.
+- **Linux:** any distribution: the binary is static, with nothing of the system's to link.
+- **macOS:** if you downloaded the file in a browser instead, macOS blocks the app. Run `xattr -d com.apple.quarantine tuinews` once to allow it.
+
+If `tuinews` isn't found afterwards, add `~/.local/bin` to your `PATH`. Each file comes with a signed record of the commit it was built from; to check one, run `gh attestation verify <file> --repo erictran308/tuinews`. `SHA256SUMS` in the release has each file's SHA-256.
+
+**Or build it from source** (Rust 1.90 or newer, and a C compiler for the SQLite and TLS code built into tuinews: `xcode-select --install` on macOS, `build-essential` or your system's `gcc` on Linux, the Visual Studio Build Tools that rustup offers on Windows):
 
 ```sh
 cargo install tuinews --locked
@@ -59,7 +80,7 @@ Or the newest from GitHub:
 cargo install --git https://github.com/erictran308/tuinews --locked
 ```
 
-If `tuinews` isn't found afterwards, add `~/.cargo/bin` to your `PATH`.
+If a `tuinews` Cargo built isn't found afterwards, add `~/.cargo/bin` to your `PATH`.
 
 **2. Run it.**
 
