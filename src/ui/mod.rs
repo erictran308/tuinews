@@ -23,9 +23,10 @@ use ratatui::widgets::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Confirm, Focus, HelpMenu, HelpTab, Kept, Naming, PromptKind, Typed, View};
+use crate::app::{App, Confirm, Focus, HelpMenu, HelpTab, Kept, Naming, PromptKind, View};
 use crate::settings::Settings;
 use crate::theme::{self, Colors};
+use crate::typed::Typed;
 use effects::Popup;
 
 /// Below this width the sidebar and the articles take turns.

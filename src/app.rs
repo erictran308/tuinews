@@ -17,8 +17,6 @@ use futures::StreamExt;
 use ratatui::DefaultTerminal;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use unicode_normalization::char::is_combining_mark;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::article::{self, Article, ArticleId, FeedId};
 use crate::feed::{self, Fetched};
@@ -29,6 +27,7 @@ use crate::settings::Settings;
 use crate::store::{self, CategoryId, CategoryRow, FeedRow, Listing, Store};
 use crate::text;
 use crate::theme::{self, Colors};
+use crate::typed::{self, Typed};
 use crate::ui::effects::Effects;
 
 /// The longest line typed in a box.
@@ -167,147 +166,6 @@ pub struct Prompt {
 impl Prompt {
     pub fn new(kind: PromptKind, typed: Typed) -> Self {
         Self { kind, typed }
-    }
-}
-
-/// What's typed in a box (a search, a feed's address, a category's name),
-/// and where its cursor is: always between two letters as drawn, since only
-/// [`Typed::edit`] and [`Typed::paste`] change them.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Typed {
-    text: String,
-    /// Where typing goes: a byte offset in `text`.
-    cursor: usize,
-}
-
-impl Typed {
-    /// `text`, the cursor at its end.
-    pub fn new(text: String) -> Self {
-        let cursor = text.len();
-        Self { text, cursor }
-    }
-
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    /// Where typing goes: a byte offset in [`Typed::text`].
-    pub fn at(&self) -> usize {
-        self.cursor
-    }
-
-    /// Edits with `key`, at the cursor (moved as it goes). Backspace, or
-    /// Ctrl-h, which some terminals send for it, deletes the letter before
-    /// it (an accent written apart first, as an input method that retypes a
-    /// letter expects), Delete the letter after it, Ctrl-w or Alt-Backspace
-    /// the word before it, and Ctrl-u all before it (what Cmd-Backspace
-    /// sends). ← and → move it a letter; with Alt (or Alt-b and Alt-f, what
-    /// macOS's Option-← and Option-→ send), a word; Home and End, or Ctrl-a
-    /// and Ctrl-e (Cmd-← and Cmd-→), to either end; Ctrl with an arrow is
-    /// the panes'. A character that shows goes in at it, typed with AltGr too
-    /// (Ctrl and Alt, as Windows says it), while the line holds fewer than
-    /// `max`.
-    pub fn edit(&mut self, key: &KeyEvent, max: usize) {
-        let altgr = key
-            .modifiers
-            .contains(KeyModifiers::CONTROL | KeyModifiers::ALT);
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !altgr;
-        let alt = key.modifiers.contains(KeyModifiers::ALT) && !altgr;
-        let at = self.cursor;
-        let backspace = key.code == KeyCode::Backspace || (ctrl && key.code == KeyCode::Char('h'));
-        // What's deleted, and where the cursor goes.
-        let (gone, cursor) = match key.code {
-            _ if (backspace && alt) || (ctrl && key.code == KeyCode::Char('w')) => {
-                let start = self.word_before();
-                (start..at, start)
-            }
-            _ if backspace => {
-                let start = match self.text[..at].chars().next_back() {
-                    Some(c) if is_combining_mark(c) => at - c.len_utf8(),
-                    _ => self.letter_before(),
-                };
-                (start..at, start)
-            }
-            KeyCode::Char('u') if ctrl => (0..at, 0),
-            KeyCode::Char('a') if ctrl => (at..at, 0),
-            KeyCode::Char('e') if ctrl => (at..at, self.text.len()),
-            _ if ctrl => return,
-            KeyCode::Delete => (at..self.letter_after(), at),
-            KeyCode::Left | KeyCode::Char('b') if alt => (at..at, self.word_before()),
-            KeyCode::Right | KeyCode::Char('f') if alt => (at..at, self.word_after()),
-            KeyCode::Left => (at..at, self.letter_before()),
-            KeyCode::Right => (at..at, self.letter_after()),
-            KeyCode::Home => (at..at, 0),
-            KeyCode::End => (at..at, self.text.len()),
-            KeyCode::Char(c) if !alt && !text::is_hidden(c) && self.text.chars().count() < max => {
-                self.text.insert(at, c);
-                self.cursor = at + c.len_utf8();
-                return;
-            }
-            _ => return,
-        };
-        self.text.replace_range(gone, "");
-        self.cursor = cursor;
-    }
-
-    /// Where the letter before the cursor starts.
-    fn letter_before(&self) -> usize {
-        let at = self.cursor;
-        self.text[..at]
-            .grapheme_indices(true)
-            .next_back()
-            .map_or(at, |(i, _)| i)
-    }
-
-    /// Where the letter after the cursor ends.
-    fn letter_after(&self) -> usize {
-        let at = self.cursor;
-        self.text[at..]
-            .graphemes(true)
-            .next()
-            .map_or(at, |g| at + g.len())
-    }
-
-    /// Where the word before the cursor starts.
-    fn word_before(&self) -> usize {
-        self.text[..self.cursor]
-            .trim_end()
-            .rfind(' ')
-            .map_or(0, |i| i + 1)
-    }
-
-    /// Where the word after the cursor ends.
-    fn word_after(&self) -> usize {
-        let rest = &self.text[self.cursor..];
-        let start = rest.len() - rest.trim_start().len();
-        self.cursor + rest[start..].find(' ').map_or(rest.len(), |i| start + i)
-    }
-
-    /// Puts `pasted` (a line, cleaned) in at the cursor, as much as fits in a
-    /// line of `max` characters, and the cursor after it. `spaced`: whether
-    /// it had a space before it and after it, kept (one) where a word next to
-    /// it would run into it otherwise.
-    pub fn paste(&mut self, pasted: &str, spaced: (bool, bool), max: usize) {
-        if pasted.is_empty() {
-            return;
-        }
-        let (before, after) = self.text.split_at(self.cursor);
-        let word = |c: char| !c.is_whitespace();
-        let lead = if spaced.0 && before.ends_with(word) {
-            " "
-        } else {
-            ""
-        };
-        let trail = if spaced.1 && after.starts_with(word) {
-            " "
-        } else {
-            ""
-        };
-        let line = format!("{lead}{pasted}{trail}");
-        let room = max.saturating_sub(self.text.chars().count());
-        let cut = text::first_chars(&line, room);
-        self.text.insert_str(self.cursor, cut);
-        self.cursor += cut.len();
     }
 }
 
@@ -1724,12 +1582,7 @@ impl App {
         for event in events.into_iter().filter(|e| !matches!(e, Event::Key(_))) {
             self.on_terminal(event);
         }
-        let typed = |key: &KeyEvent| {
-            matches!(key.code, KeyCode::Char(_))
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        };
+        let typed = |key: &KeyEvent| typed::types(key);
         let text: String = presses
             .iter()
             .filter_map(|key| match key.code {
@@ -2597,66 +2450,6 @@ pub mod tests {
         app.on_key(key(KeyCode::Right));
         app.on_terminal(Event::Paste(" mới ".into()));
         assert_eq!(text(&app), "x mới tin ha ");
-        // ← steps over a letter written as two characters (e and its accent),
-        // and Delete takes it whole; Backspace takes the accent first, as an
-        // input method that retypes a letter expects.
-        let mut line = Typed::new("cafe\u{301}!".into());
-        for _ in 0..2 {
-            line.edit(&key(KeyCode::Left), 50);
-        }
-        assert_eq!(&line.text()[..line.at()], "caf");
-        line.edit(&key(KeyCode::Delete), 50);
-        assert_eq!(line.text(), "caf!");
-        let mut line = Typed::new("cafe\u{301}".into());
-        line.edit(&key(KeyCode::Backspace), 50);
-        assert_eq!(line.text(), "cafe");
-        // Option-← (Alt-b, or Alt with ←) goes back a word, Option-Backspace
-        // deletes one; an Alt letter isn't typed, nor does Ctrl-← move.
-        let alt = |code| KeyEvent::new(code, KeyModifiers::ALT);
-        let mut line = Typed::new("tin ha noi".into());
-        line.edit(&alt(KeyCode::Char('b')), 50);
-        assert_eq!(&line.text()[line.at()..], "noi");
-        line.edit(&alt(KeyCode::Left), 50);
-        assert_eq!(&line.text()[line.at()..], "ha noi");
-        line.edit(&alt(KeyCode::Char('f')), 50);
-        assert_eq!(&line.text()[line.at()..], " noi");
-        // An Alt letter isn't typed, nor does Ctrl-← move; AltGr (Ctrl and
-        // Alt) types its letter, Cmd-← and Cmd-→ (Ctrl-a, Ctrl-e) go to
-        // either end, and Cmd-Backspace (Ctrl-u) deletes all before.
-        line.edit(&alt(KeyCode::Char('x')), 50);
-        line.edit(&KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL), 50);
-        assert_eq!(&line.text()[line.at()..], " noi");
-        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
-        line.edit(&KeyEvent::new(KeyCode::Char('ą'), altgr), 50);
-        assert_eq!(line.text(), "tin haą noi");
-        line.edit(
-            &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            50,
-        );
-        assert_eq!(line.at(), 0);
-        line.edit(
-            &KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
-            50,
-        );
-        assert_eq!(line.at(), line.text().len());
-        line.edit(&alt(KeyCode::Char('b')), 50);
-        line.edit(
-            &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
-            50,
-        );
-        assert_eq!(line.text(), "noi");
-        // Backspace takes a flag whole: it's one letter.
-        let mut flags = Typed::new("🇻🇳🇺🇸".into());
-        flags.edit(&key(KeyCode::Left), 50);
-        flags.edit(&key(KeyCode::Backspace), 50);
-        assert_eq!(flags.text(), "🇺🇸");
-        assert_eq!(flags.at(), 0);
-        let mut line = Typed::new("tin ha noi".into());
-        line.edit(&alt(KeyCode::Char('b')), 50);
-        line.edit(&alt(KeyCode::Left), 50);
-        line.edit(&alt(KeyCode::Char('f')), 50);
-        line.edit(&alt(KeyCode::Backspace), 50);
-        assert_eq!(line.text(), "tin  noi");
     }
 
     #[test]
