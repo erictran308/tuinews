@@ -2649,14 +2649,24 @@ pub mod tests {
     #[test]
     fn a_file_dropped_on_the_terminal_opens_the_add_box() {
         let mut app = app();
-        let dropped = r"/Users/me/My\ Exports/feeds.opml";
+        // As a terminal writes a file dropped on it: escaped, or quoted on
+        // Windows, where a path with no drive may be another computer's.
+        let dropped = if cfg!(windows) {
+            r#""C:\Users\me\My Exports\feeds.opml""#
+        } else {
+            r"/Users/me/My\ Exports/feeds.opml"
+        };
         app.on_terminal(Event::Paste(dropped.into()));
         let prompt = app.prompt.as_ref().unwrap();
         assert_eq!(prompt.kind, PromptKind::AddFeed);
         assert_eq!(prompt.typed.text(), dropped);
         // Quoted, its spaces stay as they are.
         app.prompt = None;
-        let quoted = "'/Users/me/My  Exports/feeds.opml'";
+        let quoted = if cfg!(windows) {
+            r#""C:\Users\me\My  Exports\feeds.opml""#
+        } else {
+            "'/Users/me/My  Exports/feeds.opml'"
+        };
         app.on_terminal(Event::Paste(quoted.into()));
         assert_eq!(app.prompt.as_ref().unwrap().typed.text(), quoted);
         // Text that only starts like a path stays out of it.
