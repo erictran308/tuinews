@@ -6,6 +6,8 @@
 //! and what's left goes through `article::lines`, so nothing in it can
 //! reach the terminal as anything but text.
 
+use std::collections::HashMap;
+
 use ego_tree::NodeRef;
 use scraper::{ElementRef, Html, Node};
 
@@ -264,11 +266,12 @@ pub fn article_text(page: &str, base: &str) -> Vec<Block> {
         .filter(|e| e.value().name() == "p" && !outside_article(e))
         .collect();
     // Each paragraph's text counts for its parent, and half for the one
-    // above: the text is where the most is.
-    let mut scores: Vec<(ego_tree::NodeId, usize)> = Vec::new();
-    let mut add = |id: ego_tree::NodeId, n: usize| match scores.iter_mut().find(|(i, _)| *i == id) {
-        Some((_, score)) => *score += n,
-        None => scores.push((id, n)),
+    // above: the text is where the most is (a tie, the one counted last).
+    // Each's score, and when it was first counted.
+    let mut scores: HashMap<ego_tree::NodeId, (usize, usize)> = HashMap::new();
+    let mut add = |id: ego_tree::NodeId, n: usize| {
+        let next = scores.len();
+        scores.entry(id).or_insert((0, next)).0 += n;
     };
     for p in &paragraphs {
         let length = words_of(p).chars().count();
@@ -285,7 +288,7 @@ pub fn article_text(page: &str, base: &str) -> Vec<Block> {
     }
     let Some(best) = scores
         .iter()
-        .max_by_key(|(_, score)| *score)
+        .max_by_key(|(_, scored)| **scored)
         .and_then(|(id, _)| document.tree.get(*id))
         .and_then(ElementRef::wrap)
     else {

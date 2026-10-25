@@ -66,7 +66,8 @@ enum Built {
     /// A picture in an article's text, in rows.
     Sliced(SlicedProtocol),
     /// A picture in an article's text whose shape (its size in pixels) is
-    /// far from its box's: it's asked for again at its own.
+    /// far from its box's, laid out before its shape was known: it's asked
+    /// for again at its own.
     Shape,
 }
 
@@ -611,6 +612,9 @@ impl Images {
             .as_ref()
             .map(|dir| dir.join(cache_name(&key.subject)));
         let font = self.picker.font_size();
+        // Laid out at its own shape, the box is as near to it as whole cells
+        // come: it's drawn in that, not asked for again without end.
+        let laid_at_shape = self.shapes.contains_key(&key.subject);
         let decoding = self.decoding.clone();
         tokio::spawn(async move {
             let (data, from_cache) = match load(&http, &downloads, &url, cache.as_deref()).await {
@@ -631,7 +635,7 @@ impl Images {
             let data = Arc::new(data);
             let bytes = data.clone();
             let decoded = tokio::task::spawn_blocking(move || {
-                contained(|| build(&picker, font, &build_key, &bytes))
+                contained(|| build(&picker, font, &build_key, &bytes, laid_at_shape))
             })
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("the picture couldn't be decoded")));
@@ -698,8 +702,15 @@ fn evict<T>(ready: &mut HashMap<Key, (T, u64)>, max: usize) {
 }
 
 /// Decodes `data` and encodes it for the terminal at `key`'s size; and its
-/// size in pixels.
-fn build(picker: &Picker, font: FontSize, key: &Key, data: &[u8]) -> Result<(Built, (u32, u32))> {
+/// size in pixels. A picture of the text `laid_at_shape` is never sent back
+/// to be laid out again.
+fn build(
+    picker: &Picker,
+    font: FontSize,
+    key: &Key,
+    data: &[u8],
+    laid_at_shape: bool,
+) -> Result<(Built, (u32, u32))> {
     let photo = decode(data)?;
     let shape = (photo.width(), photo.height());
     let (width, height) = (
@@ -711,7 +722,7 @@ fn build(picker: &Picker, font: FontSize, key: &Key, data: &[u8]) -> Result<(Bui
         Subject::Inline(_) => {
             let wanted = width as f32 / height.max(1) as f32;
             let own = shape.0 as f32 / shape.1.max(1) as f32;
-            if (wanted / own - 1.0).abs() > SHAPE_SLACK {
+            if !laid_at_shape && (wanted / own - 1.0).abs() > SHAPE_SLACK {
                 Built::Shape
             } else {
                 let filled = fill(&photo, width, height);
@@ -1015,7 +1026,14 @@ mod tests {
         images.new_frame();
         assert!(images.get(&key, url).is_none());
         assert_eq!(images.missing(), Some(1));
-        let (built, shape) = build(&images.picker, images.font_size(), &key, &png(64, 36)).unwrap();
+        let (built, shape) = build(
+            &images.picker,
+            images.font_size(),
+            &key,
+            &png(64, 36),
+            false,
+        )
+        .unwrap();
         images.on_built(ImageEvent {
             key: key.clone(),
             result: Ok(built),

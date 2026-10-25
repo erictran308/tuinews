@@ -19,8 +19,12 @@ pub const HOME_SIZE: usize = 600;
 pub const FEED_SIZE: usize = 300;
 /// Articles searched, newest first.
 pub const SEARCHED: usize = 5_000;
-/// History's articles kept, newest first.
+/// History's articles kept, newest first (up to [`HISTORY_SLACK`] more, till
+/// it's cut back).
 pub const HISTORY_SIZE: usize = 1_000;
+/// History is cut back to [`HISTORY_SIZE`] once it's this many over, so the
+/// checkpoint after comes once in so many articles opened, not with each.
+const HISTORY_SLACK: usize = 50;
 /// Feeds you may have, at most, those only in categories included.
 pub const MAX_FEEDS: usize = 500;
 /// Categories you may have, at most.
@@ -360,6 +364,18 @@ impl Store {
         Ok(self.db.last_insert_rowid())
     }
 
+    /// Puts a feed that was only a section in categories under Feeds and in
+    /// Home.
+    pub fn list_feed(&self, id: FeedId) -> Result<()> {
+        let changed = self
+            .db
+            .execute("UPDATE feeds SET listed = 1 WHERE id = ?1", [id])?;
+        if changed == 0 {
+            bail!("that feed is gone");
+        }
+        Ok(())
+    }
+
     /// Removes a feed, from its categories too, and its articles but those
     /// another feed brought too, or you saved or opened.
     pub fn remove_feed(&mut self, id: FeedId) -> Result<()> {
@@ -559,10 +575,11 @@ impl Store {
                 continue;
             }
             // A feed again for one whose feeds were all removed (kept as
-            // saved, or in History).
+            // saved, or in History): it says it's from this one now.
             tx.execute(
                 "UPDATE articles SET title = ?2, summary = ?3, image = COALESCE(?4, image),
                         author = ?5, category = ?6, seen_at = ?7,
+                        source = CASE WHEN feed_id IS NULL THEN ?9 ELSE source END,
                         feed_id = COALESCE(feed_id, ?8)
                  WHERE id = ?1",
                 params![
@@ -573,7 +590,8 @@ impl Store {
                     item.author,
                     item.category,
                     now,
-                    feed_id
+                    feed_id,
+                    source
                 ],
             )?;
         }
@@ -623,7 +641,7 @@ impl Store {
             Listing::History => (
                 format!(
                     "SELECT {COLUMNS} {from} JOIN history h ON h.article_id = a.id
-                     ORDER BY h.at DESC LIMIT {HISTORY_SIZE}"
+                     ORDER BY h.at DESC"
                 ),
                 None,
             ),
@@ -698,19 +716,26 @@ impl Store {
         self.scrub()
     }
 
-    /// Puts an article first in History, keeping [`HISTORY_SIZE`].
+    /// Puts an article first in History, keeping [`HISTORY_SIZE`] (cut back
+    /// [`HISTORY_SLACK`] over): those left out go at once off the disk too.
     pub fn opened(&self, id: &ArticleId, at: i64) -> Result<()> {
         self.db.execute(
             "INSERT OR REPLACE INTO history (article_id, at) VALUES (?1, ?2)",
             params![id.as_str(), at],
         )?;
-        self.db.execute(
+        let gone = self.db.execute(
             &format!(
-                "DELETE FROM history WHERE article_id NOT IN
-                    (SELECT article_id FROM history ORDER BY at DESC LIMIT {HISTORY_SIZE})"
+                "DELETE FROM history
+                 WHERE (SELECT COUNT(*) FROM history) > {}
+                   AND article_id NOT IN
+                       (SELECT article_id FROM history ORDER BY at DESC LIMIT {HISTORY_SIZE})",
+                HISTORY_SIZE + HISTORY_SLACK
             ),
             [],
         )?;
+        if gone > 0 {
+            self.scrub()?;
+        }
         Ok(())
     }
 
@@ -743,7 +768,8 @@ impl Store {
     }
 
     /// Forgets articles first seen more than `days` ago that you haven't
-    /// saved or opened, and what was kept of them. At start.
+    /// saved or opened, and what was kept of them, at once off the disk
+    /// too. At start.
     pub fn prune(&mut self, days: u32, now: i64) -> Result<usize> {
         let before = now.saturating_sub(i64::from(days) * 86_400);
         let gone = self.db.execute(
@@ -752,18 +778,24 @@ impl Store {
                AND id NOT IN (SELECT article_id FROM history)",
             [before],
         )?;
-        self.tidy()?;
+        let tidied = self.tidy()?;
+        if gone + tidied > 0 {
+            self.scrub()?;
+        }
         Ok(gone)
     }
 
-    /// Read marks, texts and links to feeds of articles no longer kept.
-    fn tidy(&self) -> Result<()> {
-        self.db.execute_batch(
-            "DELETE FROM read WHERE article_id NOT IN (SELECT id FROM articles);
-             DELETE FROM bodies WHERE article_id NOT IN (SELECT id FROM articles);
-             DELETE FROM article_feeds WHERE article_id NOT IN (SELECT id FROM articles);",
-        )?;
-        Ok(())
+    /// Read marks, texts and links to feeds of articles no longer kept. How
+    /// many were.
+    fn tidy(&self) -> Result<usize> {
+        let mut gone = 0;
+        for table in ["read", "bodies", "article_feeds"] {
+            gone += self.db.execute(
+                &format!("DELETE FROM {table} WHERE article_id NOT IN (SELECT id FROM articles)"),
+                [],
+            )?;
+        }
+        Ok(gone)
     }
 
     /// Writes deleted rows' zeroed pages into the database file now.
@@ -845,15 +877,25 @@ fn seed_categories(tx: &rusqlite::Transaction) -> Result<()> {
 
 /// Removes a feed: from its categories, and its articles but those another
 /// feed brought too, or you saved or opened. An article it was the first to
-/// bring now says it's from another that brought it.
+/// bring now says it's from another that brought it, by that one's name if
+/// it has one yet.
 fn forget_feed(tx: &rusqlite::Transaction, id: FeedId) -> Result<()> {
     tx.execute("DELETE FROM feeds WHERE id = ?1", [id])?;
     tx.execute("DELETE FROM category_feeds WHERE feed_id = ?1", [id])?;
     tx.execute("DELETE FROM article_feeds WHERE feed_id = ?1", [id])?;
     tx.execute(
-        "UPDATE articles SET feed_id =
-            (SELECT feed_id FROM article_feeds af WHERE af.article_id = articles.id LIMIT 1)
-         WHERE feed_id = ?1",
+        "UPDATE articles SET feed_id = other.feed_id,
+                source = COALESCE(NULLIF(f.title, ''), articles.source)
+         FROM (SELECT article_id, MIN(feed_id) AS feed_id FROM article_feeds
+               WHERE article_id IN (SELECT id FROM articles WHERE feed_id = ?1)
+               GROUP BY article_id) other
+         JOIN feeds f ON f.id = other.feed_id
+         WHERE articles.id = other.article_id AND articles.feed_id = ?1",
+        [id],
+    )?;
+    // Those no other feed brought.
+    tx.execute(
+        "UPDATE articles SET feed_id = NULL WHERE feed_id = ?1",
         [id],
     )?;
     tx.execute(
@@ -957,7 +999,7 @@ mod tests {
         let cars = store
             .add_feed(
                 "https://vnexpress.net/rss/oto-xe-may.rss",
-                "VnExpress",
+                "VnExpress Xe",
                 false,
             )
             .unwrap();
@@ -970,7 +1012,7 @@ mod tests {
             .save_articles(home_feed, "VnExpress", &[item(1, 10)], 100)
             .unwrap();
         store
-            .save_articles(cars, "VnExpress", &[item(1, 10), item(2, 20)], 100)
+            .save_articles(cars, "VnExpress Xe", &[item(1, 10), item(2, 20)], 100)
             .unwrap();
         let titles = |listing| -> Vec<String> {
             store
@@ -997,6 +1039,7 @@ mod tests {
         let left = store.articles(&Listing::Category(category)).unwrap();
         assert_eq!(left.len(), 2);
         assert!(left.iter().all(|a| a.feed == Some(cars)));
+        assert!(left.iter().all(|a| a.source == "VnExpress Xe"));
     }
 
     #[test]
@@ -1142,6 +1185,26 @@ mod tests {
             store.read().unwrap().is_empty(),
             "read marks of what's gone"
         );
+    }
+
+    #[test]
+    fn history_is_cut_back_once_it_is_well_over() {
+        let store = Store::in_memory();
+        let count = || -> usize {
+            store
+                .db
+                .query_row("SELECT COUNT(*) FROM history", [], |r| r.get::<_, i64>(0))
+                .unwrap() as usize
+        };
+        let most = HISTORY_SIZE + HISTORY_SLACK;
+        for n in 0..=most {
+            let id = ArticleId::of(&format!("https://e.vn/{n}"));
+            store.opened(&id, n as i64).unwrap();
+            if n < most {
+                assert_eq!(count(), n + 1);
+            }
+        }
+        assert_eq!(count(), HISTORY_SIZE, "the oldest are gone");
     }
 
     #[test]

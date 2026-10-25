@@ -924,8 +924,8 @@ impl App {
             View::Category(id, _) => Some(*id),
             _ => None,
         };
-        if let Some(feed) = self.feeds.iter().find(|f| f.url == url).map(|f| f.id) {
-            return self.put_known_feed(feed, into);
+        if let Some(row) = self.feeds.iter().find(|f| f.url == url).cloned() {
+            return self.put_known_feed(&row, into);
         }
         self.adding = Some(url.clone());
         self.info(format!("Looking for a feed at {url}…"));
@@ -941,18 +941,24 @@ impl App {
     }
 
     /// A feed you asked to add that's yours already: into the category, if
-    /// it was asked for in one.
-    fn put_known_feed(&mut self, feed: FeedId, into: Option<CategoryId>) {
+    /// it was asked for in one; else under Feeds, if it was only a section
+    /// in categories (not when the category asked for is gone: it's in
+    /// others still).
+    fn put_known_feed(&mut self, row: &FeedRow, into: Option<CategoryId>) {
+        let (feed, name) = (row.id, row.name());
         let category = into.and_then(|id| self.categories.iter().find(|c| c.id == id).cloned());
         let Some(category) = category else {
-            return self.info("That feed is yours already");
+            if row.listed || into.is_some() {
+                return self.info("That feed is yours already");
+            }
+            return match self.store.list_feed(feed) {
+                Ok(()) => {
+                    self.reload();
+                    self.info(format!("{name} is under Feeds now"))
+                }
+                Err(e) => self.error(format!("Couldn't put it under Feeds: {e:#}")),
+            };
         };
-        let name = self
-            .feeds
-            .iter()
-            .find(|f| f.id == feed)
-            .map(FeedRow::name)
-            .unwrap_or_default();
         match self.store.set_in_category(category.id, feed, true) {
             Ok(_) => {
                 self.reload();
@@ -975,8 +981,8 @@ impl App {
             Ok(found) => found,
             Err(e) => return self.error(format!("No feed at {asked}: {e:#}")),
         };
-        if let Some(feed) = self.feeds.iter().find(|f| f.url == url).map(|f| f.id) {
-            return self.put_known_feed(feed, into);
+        if let Some(row) = self.feeds.iter().find(|f| f.url == url).cloned() {
+            return self.put_known_feed(&row, into);
         }
         // Into a category that's still there: only in it.
         let into = into.and_then(|id| self.categories.iter().find(|c| c.id == id).cloned());
@@ -1610,7 +1616,28 @@ impl App {
             })
             .collect();
         if !self.typing() {
-            if presses.len() >= PASTED_KEYS {
+            // Keys that only move (arrows, Enter, Backspace) are no paste's
+            // when they come alone: they came at once over a slow link. With
+            // anything else it's a paste, Ctrl-J (a pasted line's end in raw
+            // mode) and Tab too.
+            let moves = |key: &KeyEvent| {
+                matches!(
+                    key.code,
+                    KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::Enter
+                        | KeyCode::Esc
+                        | KeyCode::Backspace
+                        | KeyCode::BackTab
+                )
+            };
+            if presses.len() >= PASTED_KEYS && !presses.iter().all(moves) {
                 return self.on_terminal(Event::Paste(text));
             }
             return presses.into_iter().for_each(|key| self.on_key(key));
@@ -2432,9 +2459,15 @@ pub mod tests {
     #[test]
     fn a_paste_with_no_box_open_is_never_taken_for_keys() {
         let mut app = app();
-        let pasted: Vec<Event> = "qxyMR"
+        // A tab in it (a line copied from a table) is still a paste's, and
+        // so is a line's end (Ctrl-J in raw mode).
+        let pasted: Vec<Event> = "qx\ty\nMR"
             .chars()
-            .map(|c| Event::Key(key(KeyCode::Char(c))))
+            .map(|c| match c {
+                '\t' => Event::Key(key(KeyCode::Tab)),
+                '\n' => Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+                c => Event::Key(key(KeyCode::Char(c))),
+            })
             .collect();
         app.on_terminal_events(pasted);
         assert!(!app.quit, "q in a paste doesn't quit");
@@ -2451,6 +2484,26 @@ pub mod tests {
                 text: "genk.vn/rss/home.rss".into()
             })
         );
+    }
+
+    #[test]
+    fn keys_that_come_at_once_run_as_keys() {
+        let mut app = app();
+        app.focus = Focus::Grid;
+        app.settings.full_text = false;
+        let keys = [KeyCode::Down, KeyCode::Up, KeyCode::Enter];
+        app.on_terminal_events(keys.into_iter().map(|k| Event::Key(key(k))).collect());
+        assert!(app.reader.is_some(), "Enter opened the article");
+    }
+
+    #[test]
+    fn adding_a_section_you_have_puts_it_under_feeds() {
+        let mut app = app();
+        let url = "https://vnexpress.net/rss/oto-xe-may.rss";
+        assert!(app.listed().all(|f| f.url != url));
+        app.add_feed(url);
+        assert!(app.listed().any(|f| f.url == url));
+        assert!(app.status.as_ref().is_some_and(|s| !s.error));
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! text (`html`, `article::one_line`), links and pictures are kept only if
 //! `article::checked_link` passes them, and every read is capped.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -166,7 +167,8 @@ pub async fn fetch(
     let base = response.url().clone();
     let bytes = read_capped(response, MAX_FEED).await?;
     let vietnamese = base.host_str().is_some_and(|h| h.ends_with(".vn"));
-    let mut feed = parse(&decode(&bytes), &base, vietnamese)?;
+    let feed = tokio::task::spawn_blocking(move || parse(&decode(&bytes), &base, vietnamese));
+    let mut feed = feed.await??;
     if vietnamese {
         in_vietnams_time(&mut feed, chrono::Utc::now().timestamp());
     }
@@ -272,9 +274,10 @@ pub fn decode(bytes: &[u8]) -> String {
         .strip_prefix("<?xml")
         .and_then(|rest| rest.split("?>").next())
         .and_then(|decl| decl.split("encoding=").nth(1))
-        .and_then(|value| {
-            let quote = value.chars().next()?;
-            value[1..].split(quote).next()
+        .and_then(|value| match value.chars().next()? {
+            quote @ ('"' | '\'') => value[1..].split(quote).next(),
+            // Unquoted, leniently.
+            _ => value.split(|c: char| c.is_whitespace() || c == '?').next(),
         });
     match declared.and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes())) {
         Some(encoding) if encoding != encoding_rs::UTF_8 => {
@@ -350,7 +353,8 @@ impl Draft {
         })
     }
 
-    fn item(self, base: &reqwest::Url, zone: FixedOffset) -> Option<Item> {
+    /// The item, and the HTML of its content, for [`body_of`].
+    fn item(self, base: &reqwest::Url, zone: FixedOffset) -> Option<(Item, String)> {
         let guid = self.guid.trim();
         let link = checked_link(&self.link, Some(base)).or_else(|| {
             guid.contains("://")
@@ -383,19 +387,7 @@ impl Draft {
         pictures.sort_by_key(|(rank, _)| *rank);
         let image = pictures.iter().find_map(|(_, url)| picture_url(url, &link));
         let date = |s: &str| parse_date(s, zone);
-        // A whole article, not a teaser: a few paragraphs, or a long one.
-        let body = if self.content.contains("<p") {
-            let blocks = html::article_text(&self.content, &link);
-            let length: usize = blocks.iter().map(|b| b.text().chars().count()).sum();
-            if blocks.len() >= 3 || length >= MIN_BODY {
-                blocks
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-        Some(Item {
+        let item = Item {
             title,
             link,
             summary,
@@ -403,8 +395,24 @@ impl Draft {
             author: article::one_line(&html::summary(&self.author), article::MAX_BYLINE),
             category: article::one_line(&html::summary(&self.category), article::MAX_BYLINE),
             published: date(&self.published).or_else(|| date(&self.updated)),
-            body,
-        })
+            body: Vec::new(),
+        };
+        Some((item, self.content))
+    }
+}
+
+/// An item's own text, when `content` is the whole article, not a teaser:
+/// a few paragraphs, or a long one.
+fn body_of(content: &str, link: &str) -> Vec<Block> {
+    if !content.contains("<p") {
+        return Vec::new();
+    }
+    let blocks = html::article_text(content, link);
+    let length: usize = blocks.iter().map(|b| b.text().chars().count()).sum();
+    if blocks.len() >= 3 || length >= MIN_BODY {
+        blocks
+    } else {
+        Vec::new()
     }
 }
 
@@ -462,6 +470,8 @@ pub fn parse(xml: &str, base: &reqwest::Url, vietnamese: bool) -> Result<Feed> {
     let mut saw_feed = false;
     let mut feed = Feed::default();
     let mut draft: Option<(Draft, usize)> = None;
+    let mut items: Vec<(Item, String)> = Vec::new();
+    let mut links = HashSet::new();
     // The field being read, and how deep its element is.
     let mut reading: Option<(Field, usize)> = None;
     let mut text = String::new();
@@ -610,10 +620,14 @@ pub fn parse(xml: &str, base: &reqwest::Url, vietnamese: bool) -> Result<Feed> {
                 if let Some((_, at)) = &draft
                     && *at == depth
                     && let Some((done, _)) = draft.take()
-                    && let Some(item) = done.item(base, zone)
-                    && !feed.items.iter().any(|i| i.link == item.link)
+                    && let Some((item, content)) = done.item(base, zone)
+                    && links.insert(item.link.clone())
                 {
-                    feed.items.push(item);
+                    items.push((item, content));
+                    // A thousand items' HTML isn't all kept till the end.
+                    if items.len() >= 2 * MAX_ITEMS {
+                        keep_newest(&mut items);
+                    }
                 }
                 depth = depth.saturating_sub(1);
             }
@@ -635,13 +649,25 @@ pub fn parse(xml: &str, base: &reqwest::Url, vietnamese: bool) -> Result<Feed> {
     if !saw_feed {
         bail!("not a feed");
     }
-    // The newest, when a feed holds more than is kept.
-    if feed.items.len() > MAX_ITEMS {
-        feed.items
-            .sort_by_key(|item| std::cmp::Reverse(item.published.unwrap_or(0)));
-        feed.items.truncate(MAX_ITEMS);
-    }
+    keep_newest(&mut items);
+    // Only the kept ones' text is read: it's a page of HTML each.
+    feed.items = items
+        .into_iter()
+        .map(|(mut item, content)| {
+            item.body = body_of(&content, &item.link);
+            item
+        })
+        .collect();
     Ok(feed)
+}
+
+/// The newest [`MAX_ITEMS`] of a feed's items, when it holds more than are
+/// kept.
+fn keep_newest(items: &mut Vec<(Item, String)>) {
+    if items.len() > MAX_ITEMS {
+        items.sort_by_key(|(item, _)| std::cmp::Reverse(item.published.unwrap_or(0)));
+        items.truncate(MAX_ITEMS);
+    }
 }
 
 /// Dates from hours ahead, put right. A Vietnamese site's server can write
@@ -939,11 +965,26 @@ mod tests {
         }
         assert_eq!(decode(&bytes), text);
         assert_eq!(decode("héllo".as_bytes()), "héllo");
+        // A declaration's quote that isn't one byte is no encoding's.
+        assert_eq!(
+            decode("<?xml encoding=é?>".as_bytes()),
+            "<?xml encoding=é?>"
+        );
+        assert_eq!(
+            decode(b"<?xml encoding=\xff?>"),
+            "<?xml encoding=\u{fffd}?>"
+        );
+        // Unquoted, as a careless feed writes it.
+        assert_eq!(
+            decode(b"<?xml encoding=windows-1258 ?><t>\xe0</t>"),
+            "<?xml encoding=windows-1258 ?><t>\u{e0}</t>"
+        );
     }
 
     #[test]
     fn a_feed_with_more_than_is_kept_keeps_its_newest() {
-        let items: String = (0..150)
+        // Past twice as many, so the newest are kept along the way too.
+        let items: String = (0..450)
             .map(|i| {
                 format!(
                     "<item><title>n{i}</title><link>https://e.vn/{i}</link><pubDate>{}</pubDate></item>",
@@ -954,7 +995,8 @@ mod tests {
         let xml = format!("<rss><channel>{items}</channel></rss>");
         let feed = parse(&xml, &base("https://e.vn/rss"), true).unwrap();
         assert_eq!(feed.items.len(), MAX_ITEMS);
-        assert_eq!(feed.items[0].title, "n149");
+        assert_eq!(feed.items[0].title, "n449");
+        assert_eq!(feed.items[MAX_ITEMS - 1].title, "n350");
     }
 
     #[tokio::test]

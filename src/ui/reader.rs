@@ -31,7 +31,6 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     let article = reader.article.clone();
-    let body = reader.body.clone();
     let scroll = reader.scroll;
     // Under a popup, sixel and iTerm2 pictures aren't drawn: they'd be
     // drawn over it. They're still asked for, to be ready.
@@ -67,7 +66,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         ..inner
     };
     let w = usize::from(column.width);
-    let laid = body_layout(app, &c, &body, &article, w, column.height);
+    let laid = body_layout(app, &c, &reader.body, &article, w, column.height);
 
     // At the top: the whole head. Scrolled: the head folded to a line.
     let head_height = if scroll == 0 {
