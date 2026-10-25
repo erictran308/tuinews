@@ -7,7 +7,7 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,8 @@ use crate::text;
 use crate::theme::{self, Colors};
 use crate::typed::{self, Typed};
 use crate::ui::effects::Effects;
+use crate::ui::plural;
+use crate::{config, opml};
 
 /// The longest line typed in a box.
 pub const MAX_PROMPT: usize = 500;
@@ -51,6 +53,12 @@ pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// The name of the file at `path`, as it can be shown.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(|| config::shown(path), |n| config::shown(Path::new(n)))
+}
+
 /// What comes back from work done off the event loop.
 #[derive(Debug)]
 pub enum AppEvent {
@@ -71,6 +79,13 @@ pub enum AppEvent {
         asked: String,
         into: Option<CategoryId>,
         result: Result<(String, feed::Feed)>,
+    },
+    /// An OPML file you asked to import, read off the event loop: a file on
+    /// a mounted network folder, or one made to parse slowly, doesn't stop
+    /// the screen.
+    Opml {
+        path: PathBuf,
+        result: Result<opml::Opml>,
     },
     /// SIGHUP or SIGTERM: quit as `q` does. Unix's only: nothing sends it
     /// on Windows.
@@ -337,6 +352,10 @@ pub struct App {
     pub search_typed: Option<Typed>,
     pub help: Option<HelpMenu>,
     pub confirm: Option<Confirm>,
+    /// A new database: what to start with is asked over the screen
+    /// (`ui::welcome`), Vietnam's news sites or no feeds. Till it's
+    /// answered nothing else takes keys, and quitting asks again next time.
+    pub welcome: bool,
     pub category_menu: Option<CategoryMenu>,
     pub reader: Option<Reader>,
     pub status: Option<Status>,
@@ -383,7 +402,7 @@ fn toward(key: &KeyEvent) -> Option<Toward> {
 
 impl App {
     pub fn new(
-        store: Store,
+        mut store: Store,
         settings: Settings,
         settings_path: Option<PathBuf>,
         http: reqwest::Client,
@@ -392,6 +411,8 @@ impl App {
     ) -> Self {
         let colors = Colors::named(&settings.theme);
         let icons = Icons::pick(settings.icon_mode(), |name| std::env::var(name).ok());
+        let welcome = store.is_new().unwrap_or(false);
+        let hid = store.hide(settings.blocks());
         let mut app = Self {
             store,
             settings,
@@ -423,6 +444,7 @@ impl App {
             search_typed: None,
             help: None,
             confirm: None,
+            welcome,
             category_menu: None,
             reader: None,
             status: None,
@@ -437,6 +459,9 @@ impl App {
             needs_reload: false,
             clipboard: None,
         };
+        if let Err(e) = hid {
+            app.error(format!("Couldn't hide what your blocked words name: {e:#}"));
+        }
         app.reload_marks();
         app.reload();
         app
@@ -551,6 +576,7 @@ impl App {
                 into,
                 result,
             } => self.on_found(&asked, into, result),
+            AppEvent::Opml { path, result } => self.on_opml(&path, result),
             AppEvent::Quit => self.quit = true,
         }
     }
@@ -768,7 +794,10 @@ impl App {
     /// Whether a popup is open over the screen (over the reader too, if
     /// it's open).
     pub fn popup_open(&self) -> bool {
-        self.help.is_some() || self.confirm.is_some() || self.category_menu.is_some()
+        self.help.is_some()
+            || self.confirm.is_some()
+            || self.category_menu.is_some()
+            || self.welcome
     }
 
     /// Whether anything is open over the articles: a popup, or the reader.
@@ -902,7 +931,11 @@ impl App {
     /// Looks for the feed at what you typed (a feed's address, or a site's
     /// page that names its feed), to add it once it's found: into the
     /// category shown, if one is (and then only there), else under Feeds.
+    /// A file's path imports the feeds it lists (`import`).
     fn add_feed(&mut self, typed: &str) {
+        if let Some(path) = opml::path_in(typed) {
+            return self.import(&path);
+        }
         let typed = typed.trim();
         let with_scheme = if typed.contains("://") {
             typed.to_string()
@@ -930,6 +963,61 @@ impl App {
                 result,
             });
         });
+    }
+
+    /// Reads the OPML file at `path`, another reader's list of feeds, to
+    /// import it once it's read (`on_opml`).
+    fn import(&mut self, path: &Path) {
+        self.info(format!("Reading {}…", file_name(path)));
+        let (tx, path) = (self.tx.clone(), path.to_path_buf());
+        tokio::task::spawn_blocking(move || {
+            let result = opml::read(&path);
+            let _ = tx.send(AppEvent::Opml { path, result });
+        });
+    }
+
+    /// Imports an OPML file read: its feeds go under Feeds, and its folders
+    /// become categories. They're fetched at once.
+    fn on_opml(&mut self, path: &Path, result: Result<opml::Opml>) {
+        let read = match result {
+            Ok(read) => read,
+            Err(e) => return self.error(format!("{e:#}")),
+        };
+        let name = file_name(path);
+        if read.feeds.is_empty() {
+            return self.error(match read.skipped {
+                0 => format!("No feeds in {name}"),
+                n => format!(
+                    "No feeds in {name} tuinews may fetch: {n} left out, not http or https, or on your network"
+                ),
+            });
+        }
+        let done = match self.store.import(&read) {
+            Ok(done) => done,
+            Err(e) => return self.error(format!("Couldn't import {name}: {e:#}")),
+        };
+        self.reload();
+        self.refresh_feeds(false);
+        let mut said = format!("Imported {}", plural(done.added, "feed", "feeds"));
+        if done.categories > 0 {
+            said += &format!(" and {}", plural(done.categories, "category", "categories"));
+        }
+        said += &format!(" from {name}");
+        if done.known > 0 {
+            said += &format!(" · {} yours already", done.known);
+        }
+        let left = read.skipped + done.over;
+        if left > 0 {
+            said += &format!(" · {left} left out");
+        }
+        if done.folders_over > 0 {
+            said += &format!(
+                " · {} not made, {} categories at most",
+                plural(done.folders_over, "folder", "folders"),
+                store::MAX_CATEGORIES
+            );
+        }
+        self.info(said);
     }
 
     /// A feed you asked to add that's yours already: into the category, if
@@ -1508,7 +1596,14 @@ impl App {
         };
         match Settings::save_one(&path, key, value) {
             Ok(settings) => {
-                self.settings = settings;
+                let blocked = std::mem::replace(&mut self.settings, settings).blocked_words;
+                // A new list only: hiding looks at every article kept.
+                if self.settings.blocked_words != blocked {
+                    if let Err(e) = self.store.hide(self.settings.blocks()) {
+                        self.error(format!("Couldn't hide what your blocked words name: {e:#}"));
+                    }
+                    self.needs_reload = true;
+                }
                 self.colors = Colors::named(&self.settings.theme);
             }
             Err(e) => self.error(format!("{e:#}")),
@@ -1653,7 +1748,19 @@ impl App {
             Event::Paste(text) => {
                 // Cut before cleaning, so a huge paste costs nothing.
                 let clean = text::clean(text::first_chars(&text, 2 * MAX_PROMPT));
-                let line = article::one_line(&clean, MAX_PROMPT);
+                // A file's path stays as it is, its spaces too, where it may
+                // be one: in the box to add a feed, or with no box open.
+                let for_adding = match &self.prompt {
+                    Some(prompt) => prompt.kind == PromptKind::AddFeed,
+                    None => !self.typing(),
+                };
+                let as_path = for_adding.then(|| opml::path_in(&clean)).flatten();
+                let path = as_path.is_some();
+                let line = if path && !clean.chars().any(char::is_control) {
+                    text::first_chars(clean.trim(), MAX_PROMPT).to_string()
+                } else {
+                    article::one_line(&clean, MAX_PROMPT)
+                };
                 // In a box, a space it had at either end is kept where a word
                 // would run into it otherwise.
                 let spaced = (
@@ -1667,9 +1774,18 @@ impl App {
                 {
                     naming.typed.paste(&line, spaced, store::MAX_CATEGORY_NAME);
                 } else if !self.popup_open() {
-                    // A link pasted with no box open: the box to add it.
+                    // A link pasted with no box open, or a file's path (one
+                    // dropped on the terminal): the box to add it.
                     let pasted = line;
-                    if pasted.contains('.') && !pasted.contains(' ') {
+                    let link = pasted.contains('.') && !pasted.contains(' ');
+                    // A path opens it only if it's a list of feeds' by its
+                    // name, not any text starting with `/`.
+                    let list = as_path.as_ref().is_some_and(|p| {
+                        p.extension().is_some_and(|e| {
+                            e.eq_ignore_ascii_case("opml") || e.eq_ignore_ascii_case("xml")
+                        })
+                    });
+                    if link || list {
                         self.open_add_feed(pasted);
                     } else {
                         self.info(
@@ -1690,6 +1806,9 @@ impl App {
         if ctrl && key.code == KeyCode::Char('c') {
             self.quit = true;
             return;
+        }
+        if self.welcome {
+            return self.on_welcome_key(key, ctrl);
         }
         if self.prompt.is_some() {
             return self.on_prompt_key(key);
@@ -1752,6 +1871,34 @@ impl App {
                 Focus::Sidebar => self.on_sidebar_key(key),
                 Focus::Grid => self.on_grid_key(key),
             },
+        }
+    }
+
+    /// The first start's question: `y` starts with Vietnam's news sites and
+    /// the categories made of their sections, `n` with no feeds and the box
+    /// to add one open, `q` quits. Other keys do nothing: the answer stays.
+    fn on_welcome_key(&mut self, key: KeyEvent, ctrl: bool) {
+        if ctrl {
+            return;
+        }
+        match key.code {
+            KeyCode::Char('y' | 'Y') => match self.store.seed_defaults() {
+                Ok(_) => {
+                    self.welcome = false;
+                    self.reload();
+                    self.refresh_feeds(false);
+                }
+                Err(e) => self.error(format!("Couldn't add them: {e:#}")),
+            },
+            KeyCode::Char('n' | 'N') => match self.store.start_empty() {
+                Ok(()) => {
+                    self.welcome = false;
+                    self.open_add_feed(String::new());
+                }
+                Err(e) => self.error(format!("{e:#}")),
+            },
+            KeyCode::Char('q') => self.quit = true,
+            _ => {}
         }
     }
 
@@ -2134,6 +2281,23 @@ pub mod tests {
         App::new(store, Settings::default(), None, feed::client(), tx, images)
     }
 
+    /// An app on a new store: nothing put in yet, so it asks what to
+    /// start with.
+    pub fn new_app() -> App {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        std::mem::forget(rx);
+        let mut images = Images::new(Picker::halfblocks(), tx.clone(), feed::client(), None);
+        images.go_offline();
+        App::new(
+            Store::in_memory(),
+            Settings::default(),
+            None,
+            feed::client(),
+            tx,
+            images,
+        )
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -2161,6 +2325,70 @@ pub mod tests {
                 ..feed::Item::default()
             })
             .collect()
+    }
+
+    // A runtime for the fetches `y` starts, which never run: nothing here
+    // awaits.
+    #[tokio::test]
+    async fn a_first_start_asks_before_putting_vietnams_news_in() {
+        let mut app = new_app();
+        assert!(app.welcome);
+        press(&mut app, "jR?a");
+        assert!(app.welcome, "other keys do nothing");
+        assert!(app.feeds.is_empty() && app.help.is_none() && app.prompt.is_none());
+        press(&mut app, "y");
+        assert!(!app.welcome);
+        assert_eq!(app.listed().count(), crate::defaults::FEEDS.len());
+        assert_eq!(app.categories.len(), crate::defaults::CATEGORIES.len());
+        assert!(app.refreshing.is_some(), "fetching them");
+    }
+
+    #[test]
+    fn a_first_start_with_no_feeds_opens_the_box_to_add_one() {
+        let mut app = new_app();
+        press(&mut app, "n");
+        assert!(!app.welcome);
+        assert!(app.feeds.is_empty() && app.categories.is_empty());
+        assert!(matches!(
+            app.prompt,
+            Some(Prompt {
+                kind: PromptKind::AddFeed,
+                ..
+            })
+        ));
+        assert!(!app.store.is_new().unwrap(), "not asked again");
+    }
+
+    // As above: the fetches it starts never run.
+    #[tokio::test]
+    async fn an_opml_files_path_in_the_add_box_imports_its_feeds() {
+        let dir = std::env::temp_dir().join(format!("tuinews-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("feeds.opml");
+        std::fs::write(
+            &file,
+            r#"<opml version="2.0"><body><outline text="Reading">
+                <outline text="Hacker News" xmlUrl="https://news.ycombinator.com/rss"/>
+            </outline></body></opml>"#,
+        )
+        .unwrap();
+        let mut app = new_app();
+        press(&mut app, "n");
+        press(&mut app, &file.display().to_string());
+        app.on_key(key(KeyCode::Enter));
+        let said = app.status.as_ref().map(|s| s.text.as_str());
+        assert_eq!(said, Some("Reading feeds.opml…"));
+        // What the blocking thread sends back once it's read.
+        app.on_event(AppEvent::Opml {
+            path: file.clone(),
+            result: opml::read(&file),
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(app.listed().any(|f| f.title == "Hacker News"));
+        assert_eq!(app.categories[0].name, "Reading");
+        assert!(app.refreshing.is_some(), "fetching it");
+        let said = app.status.as_ref().map(|s| s.text.as_str());
+        assert_eq!(said, Some("Imported 1 feed and 1 category from feeds.opml"));
     }
 
     #[test]
@@ -2416,6 +2644,25 @@ pub mod tests {
         assert_eq!(app.view, View::Home);
         assert_eq!(app.listed().count(), crate::defaults::FEEDS.len() - 1);
         assert!(app.articles.is_empty());
+    }
+
+    #[test]
+    fn a_file_dropped_on_the_terminal_opens_the_add_box() {
+        let mut app = app();
+        let dropped = r"/Users/me/My\ Exports/feeds.opml";
+        app.on_terminal(Event::Paste(dropped.into()));
+        let prompt = app.prompt.as_ref().unwrap();
+        assert_eq!(prompt.kind, PromptKind::AddFeed);
+        assert_eq!(prompt.typed.text(), dropped);
+        // Quoted, its spaces stay as they are.
+        app.prompt = None;
+        let quoted = "'/Users/me/My  Exports/feeds.opml'";
+        app.on_terminal(Event::Paste(quoted.into()));
+        assert_eq!(app.prompt.as_ref().unwrap().typed.text(), quoted);
+        // Text that only starts like a path stays out of it.
+        app.prompt = None;
+        app.on_terminal(Event::Paste("/r/rust is great".into()));
+        assert!(app.prompt.is_none());
     }
 
     #[test]

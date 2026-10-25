@@ -1,9 +1,9 @@
-//! The feeds a new tuinews starts with: Vietnam's biggest news sites, each
-//! site's newest articles, then two in English; and categories made of the
-//! same sites' sections (their Xe, Công nghệ… feeds). All checked to answer
-//! with RSS in October 2026 (`cargo test -- --ignored live_every_default`).
-//! `a` adds others, `x` on one in the sidebar removes it, `F` puts a feed in
-//! categories.
+//! The feeds a new tuinews offers to start with (`App.welcome`): Vietnam's
+//! biggest news sites, each site's newest articles, then two in English;
+//! and categories made of the same sites' sections (their Xe, Công nghệ…
+//! feeds). All checked to answer with RSS in October 2026 (`cargo test --
+//! --ignored live_every_default`). `a` adds others, `x` on one in the
+//! sidebar removes it, `F` puts a feed in categories.
 
 pub struct DefaultFeed {
     pub name: &'static str,

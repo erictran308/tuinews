@@ -8,6 +8,7 @@ mod hero;
 mod html;
 mod icons;
 mod images;
+mod opml;
 mod proxy;
 mod screen;
 mod settings;
@@ -20,8 +21,17 @@ mod typed;
 mod ui;
 
 use std::io::{Write, stdout};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+
+/// What tuinews was asked to do.
+enum Command {
+    Run,
+    Check,
+    /// Your feeds as OPML: into a new file, or else to stdout.
+    Export(Option<PathBuf>),
+}
 
 fn main() -> Result<()> {
     // Before any thread exists: PATH keeps only its absolute folders, as
@@ -44,10 +54,18 @@ fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     config::load_dotenv();
-    let mut args = std::env::args().skip(1);
-    let check = match args.next().as_deref() {
-        None => false,
-        Some("--check") => true,
+    // Not `args`, which panics on a name that isn't UTF-8: a file's may not be.
+    let mut args = std::env::args_os().skip(1);
+    let first = args.next().map(|a| a.to_string_lossy().into_owned());
+    let command = match first.as_deref() {
+        None => Command::Run,
+        Some("--check") => Command::Check,
+        Some("--export") => match args.next() {
+            Some(file) if file.to_string_lossy().starts_with('-') => {
+                bail!("--export takes a file's name, or nothing; see tuinews --help")
+            }
+            file => Command::Export(file.map(PathBuf::from)),
+        },
         Some("-h" | "--help") => return print(&help()?),
         Some("-V" | "--version") => {
             return print(&format!("tuinews {}\n", env!("CARGO_PKG_VERSION")));
@@ -57,6 +75,12 @@ async fn run() -> Result<()> {
             text::clean(other)
         ),
     };
+    if let Some(extra) = args.next() {
+        bail!(
+            "unexpected argument {:?}; see tuinews --help",
+            text::clean(&extra.to_string_lossy())
+        );
+    }
 
     // Everything that can fail does so before the terminal is taken over,
     // so errors print as normal text.
@@ -65,10 +89,16 @@ async fn run() -> Result<()> {
     let settings_path = settings::path(&config.data_dir);
     let (settings, unknown_settings) = settings::Settings::load_checked(&settings_path)?;
     let mut store = store::Store::open(&config.data_dir.join("tuinews.db"))?;
-    store.seed_defaults()?;
+    // A new database waits for what to start with (`App.welcome`); an older
+    // one gets what's new in the defaults since: the categories.
+    if !store.is_new()? {
+        store.seed_defaults()?;
+    }
     store.prune(settings.keep_days(), app::now())?;
-    if check {
-        return print_check(&config, &settings).await;
+    match command {
+        Command::Check => return print_check(&config, &settings).await,
+        Command::Export(to) => return export(&store, to.as_deref()),
+        Command::Run => {}
     }
     let image_cache = config.data_dir.join("cache").join("images");
     config::private_dir(&image_cache)?;
@@ -147,6 +177,23 @@ images       {images}
     ))
 }
 
+/// `tuinews --export [FILE]`: your feeds and categories as OPML, into FILE
+/// (a new file) or else to stdout.
+fn export(store: &store::Store, to: Option<&Path>) -> Result<()> {
+    let (feeds, categories) = (store.feeds()?, store.categories()?);
+    let opml = opml::write(&feeds, &categories, chrono::Utc::now());
+    let Some(path) = to else {
+        return print(&opml);
+    };
+    opml::save(path, &opml)?;
+    print(&format!(
+        "Wrote {} and {} to {}\n",
+        ui::plural(feeds.len(), "feed", "feeds"),
+        ui::plural(categories.len(), "category", "categories"),
+        config::shown(path)
+    ))
+}
+
 /// Writes to stdout. A reader that stops early (`tuinews --help | head -1`)
 /// is fine, where `println!` would panic on the closed pipe.
 fn print(text: &str) -> Result<()> {
@@ -162,14 +209,19 @@ fn help() -> Result<String> {
 The news in your terminal: your RSS feeds as a grid of article cards with
 their pictures, a reader for their text, arrow keys or vim keys.
 
-Usage: tuinews [-h | --help] [-V | --version] [--check]
+Usage: tuinews [-h | --help] [-V | --version] [--check] [--export [FILE]]
 
 Inside the app, ? lists the keys and q quits. --check says what tuinews
 found: your feeds, the proxy, and how your terminal draws images.
 
-It starts with Vietnam's biggest news sites (VnExpress, Tuổi Trẻ, Thanh
-Niên, Dân Trí, VietnamNet and more). a adds another feed (its address, or
-a site's that names one), x on one in the sidebar removes it.
+--export writes your feeds and categories as OPML, for another reader or to
+keep: into FILE (a new file), or else to the screen. To bring them in, press
+a in tuinews and give the file's path.
+
+The first time, it asks whether to start with Vietnam's biggest news sites
+(VnExpress, Tuổi Trẻ, Thanh Niên, Dân Trí, VietnamNet and more) or with no
+feeds. a adds a feed (its address, or a site's that names one), or those of
+an OPML file another reader exported; x on one in the sidebar removes it.
 
 Your feeds, what you've read, saved and opened, and your settings are kept
 only on this computer, in:

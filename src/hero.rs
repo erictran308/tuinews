@@ -258,6 +258,8 @@ fn link(story: &Story, i: usize) -> String {
 fn hero_app(picker: Picker) -> App {
     let at = now();
     let mut store = Store::in_memory();
+    // Made-up sites only: not the first start's question.
+    store.start_empty().unwrap();
     let categories: Vec<_> = CATEGORIES
         .iter()
         .map(|name| store.add_category(name).unwrap())

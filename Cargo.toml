@@ -10,7 +10,7 @@ rust-version = "1.90"
 keywords = ["rss", "news", "tui", "terminal", "vim"]
 categories = ["command-line-utilities"]
 # What goes into the published crate, and nothing else.
-include = ["src/**/*.rs", "themes/*.toml", "README.md", "LICENSE", "SECURITY.md", "Cargo.toml", "Cargo.lock"]
+include = ["src/**/*.rs", "themes/*.toml", "testdata/*.xml", "README.md", "LICENSE", "SECURITY.md", "Cargo.toml", "Cargo.lock"]
 
 [[bin]]
 name = "tuinews"

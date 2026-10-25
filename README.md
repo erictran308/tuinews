@@ -25,8 +25,9 @@ Arrow keys or vim keys. No account, no tracking, nothing but the feeds you read.
 ## Why tuinews
 
 - **Looks like a news site.** Home (every feed's newest), Search, Saved and History in the sidebar, then your categories, then your feeds, each with what you haven't read. Articles in a grid of cards: the picture, the source and how long ago, the title, the start of the summary. A red dot marks what you haven't read.
-- **Vietnam's news, from the start.** It comes with the biggest Vietnamese news sites: VnExpress, Tuổi Trẻ, Thanh Niên, Dân Trí, VietnamNet, VTC News, Tiền Phong, VietnamPlus, Nhân Dân, Sài Gòn Giải Phóng, CafeF, GenK, Kenh14, and VnExpress International and Tuoi Tre News in English. `a` adds any other feed, `x` removes one.
-- **Categories: only what you're into.** Tech, Cars, Business, World, Sports, Entertainment, Health and Travel, each made of the big sites' own sections (VnExpress's Xe, Tuổi Trẻ's Công nghệ, Dân Trí's Ô tô xe máy…, 47 in all), so Cars is car news from seven papers, and nothing else. The sections show only in their categories, not in Home. `F` puts a feed in categories or takes it out, makes one (`n`), renames (`r`) or deletes one (`x`); `a` in a category adds a feed straight into it.
+- **Vietnam's news, or only your own feeds.** The first time it starts, tuinews asks whether to start with the biggest Vietnamese news sites: VnExpress, Tuổi Trẻ, Thanh Niên, Dân Trí, VietnamNet, VTC News, Tiền Phong, VietnamPlus, Nhân Dân, Sài Gòn Giải Phóng, CafeF, GenK, Kenh14, and VnExpress International and Tuoi Tre News in English. Say no (`n`) and it starts with no feeds, for your own. `a` adds any feed, `x` removes one.
+- **Your feeds, in and out.** Coming from Feedly, Inoreader, NetNewsWire or another reader? Export your feeds as OPML, press `a` and give the file's path (or drop the file on the terminal): its feeds come in under Feeds, its folders as categories. `tuinews --export feeds.opml` takes yours out again, for another reader or to keep.
+- **Categories: only what you're into.** Vietnam's news comes with Tech, Cars, Business, World, Sports, Entertainment, Health and Travel, each made of the big sites' own sections (VnExpress's Xe, Tuổi Trẻ's Công nghệ, Dân Trí's Ô tô xe máy…, 47 in all), so Cars is car news from seven papers, and nothing else. The sections show only in their categories, not in Home. `F` puts a feed in categories or takes it out, makes one (`n`), renames (`r`) or deletes one (`x`); `a` in a category adds a feed straight into it.
 - **Read here.** `Enter` opens the article in a popup that fades in over the dimmed page (`Esc` closes it): its picture beside its title, source and date, then its whole text with its pictures in their places, read from its page the way a browser's reader view does it (or from the feed, when it carries the whole article). `j k`, `Space` and `b` scroll, the pictures a row at a time; `]` and `[` go to the next article and the one before. `o` opens it in your browser.
 - **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `gg` / `G`, `Ctrl-d` / `Ctrl-u`, `PgUp` / `PgDn`. They move in the pane you're in; `Ctrl` with an arrow or `h j k l` goes to the pane that way. `?` lists every key, `O` opens the settings.
 - **Search without accents.** `/` searches the articles you have: `ha noi` finds Hà Nội, `da nang` finds Đà Nẵng.
@@ -59,7 +60,7 @@ tuinews
 
 Any terminal works; Ghostty, kitty, WezTerm and iTerm2 show the articles' real pictures (see [Pictures and icons](#pictures-and-icons)).
 
-The first start fetches the default feeds and the categories' sections, some 60: Home fills up within a few seconds, the categories within a dozen. To add a feed, press `a` and type or paste its address, or just a site's (`genk.vn`): tuinews finds the feed the site's page names.
+The first time, tuinews asks what to start with: `y` for Vietnam's news sites and the categories made of their sections, some 60 feeds (Home fills up within a few seconds, the categories within a dozen), or `n` for no feeds. To add a feed, press `a` and type or paste its address, or just a site's (`genk.vn`): tuinews finds the feed the site's page names. To bring yours from another reader, export them as OPML and give `a` the file's path (`~/Downloads/feeds.opml`).
 
 ### Categories
 
@@ -97,7 +98,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `F` | Categories: put the feed (the sidebar's, or the article's) in some or take it out (`Enter`), make one (`n`), rename one (`r`) or delete one (`x`, after you press `y`) |
 | `v` | A list (two rows an article, no pictures) or cards |
 | `/` or `s` | Search your articles (`Enter` searches, `Esc` cancels) |
-| `a` | Add a feed: its address, or a site's that names one; in a category, into it (and only there). A link pasted with no box open goes in this box |
+| `a` | Add a feed: its address, or a site's that names one; in a category, into it (and only there). Or an OPML file's path, in any view: its feeds under Feeds, its folders as categories. A link pasted with no box open goes in this box |
 | `R` | Fetch every feed now |
 | `Backspace` / `Ctrl-o` | Back to the view before |
 | `?` / `O` | Every key / the settings |
@@ -143,7 +144,7 @@ Icons are Nerd Font icons in Ghostty, kitty and WezTerm, which have them built i
 
 - **No account, no tracking.** tuinews asks the sites for their feeds, the pictures on the cards you see, and the page of an article you open. Nothing else is sent anywhere, and no cookie is ever kept.
 - **Pictures over https only.** A picture is never asked for in the clear (which would tell the network what you read), nor from an address on your computer or network.
-- **Links that are what they say.** Links and pictures from a feed are kept only if they're `http` or `https`, on a named host (not an IP address, `localhost` or `*.local`), with no user or password in them (`https://vnexpress.net@evil.example` reads as one site and goes to another). Redirects go only where a link could, never from https to http.
+- **Links that are what they say.** Links and pictures from a feed, and an OPML file's feeds, are kept only if they're `http` or `https`, on a named host (not an IP address, `localhost` or `*.local`), with no user or password in them (`https://vnexpress.net@evil.example` reads as one site and goes to another). Redirects go only where a link could, never from https to http.
 - **Text stays text.** Titles, summaries and articles' text are made plain text (no tags, scripts or links), cleaned of terminal escape codes and other characters that don't show, and capped in length, before they're kept or shown. A link in an article is text: nothing opens it. Pictures are decoded only as JPEG, PNG, WebP or GIF, within size limits, with a decoder's crash contained.
 - **One route for everything.** If you use a proxy, every request goes through the same one: the first set of `https_proxy`, `HTTPS_PROXY`, `all_proxy`, `ALL_PROXY`, `http_proxy`, `HTTP_PROXY`. It must be an `http://` or `https://` proxy; tuinews refuses to start with another kind rather than go around it. With none set, nothing uses a proxy, not even one in your system settings.
 - **Your lists stay here.** Your feeds, what you've read, saved and opened, and your settings are in one folder readable only by you. `x` takes an article off Saved or History for good, wiped from the database file at once. `history = false` stops History.
@@ -161,7 +162,9 @@ Everything is in one folder on your machine (`tuinews --help` prints its path):
 | Linux | `~/.local/share/tuinews` |
 | Windows | `%LOCALAPPDATA%\tuinews` |
 
-It holds `tuinews.db` (your feeds and categories, their articles, what you've read, saved and opened, and articles' text once read), `settings.toml`, and a cache of pictures. Deleting it starts tuinews afresh, with the default feeds and categories again.
+It holds `tuinews.db` (your feeds and categories, their articles, what you've read, saved and opened, and articles' text once read), `settings.toml`, and a cache of pictures. Deleting it starts tuinews afresh: it asks again what to start with.
+
+To keep your feeds and categories, or take them to another reader: `tuinews --export feeds.opml` writes them as OPML to a new file readable only by you (`tuinews --export` alone prints them). `a` in tuinews, given that file's path, brings them back, each in its categories again.
 
 | Variable | Use |
 | --- | --- |

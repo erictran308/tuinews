@@ -3,7 +3,7 @@
 //! feed that brought it), which you've read, saved or opened, and articles'
 //! text once read from their pages.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -11,7 +11,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::article::{self, Article, ArticleId, FeedId};
 use crate::html::Block;
-use crate::{config, defaults, feed, text};
+use crate::settings::Blocks;
+use crate::{config, defaults, feed, opml, text};
 
 /// The newest articles Home shows, of all your feeds.
 pub const HOME_SIZE: usize = 600;
@@ -32,8 +33,9 @@ pub const MAX_CATEGORIES: usize = 100;
 /// The longest name of a category, in characters.
 pub const MAX_CATEGORY_NAME: usize = 40;
 /// What the schema is at: 2 added categories, and articles linked to every
-/// feed that brought them (`article_feeds`).
-const VERSION: i64 = 2;
+/// feed that brought them (`article_feeds`); 3 the article's date beside
+/// each link, so a feed's newest are read off an index ([`newest`]).
+const VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -65,9 +67,12 @@ CREATE INDEX IF NOT EXISTS category_feeds_by_feed ON category_feeds (feed_id);
 CREATE TABLE IF NOT EXISTS article_feeds (
     article_id TEXT NOT NULL,
     feed_id INTEGER NOT NULL,
+    -- The article's, as in articles.
+    published INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (article_id, feed_id)
 );
-CREATE INDEX IF NOT EXISTS article_feeds_by_feed ON article_feeds (feed_id);
+-- Its index by feed and date is made by migrate, once an older table has the
+-- column.
 CREATE TABLE IF NOT EXISTS articles (
     id TEXT PRIMARY KEY,
     feed_id INTEGER,
@@ -131,20 +136,38 @@ pub struct CategoryRow {
     pub unread: usize,
 }
 
+/// What importing an OPML file did.
+#[derive(Debug, Default, PartialEq)]
+pub struct Imported {
+    pub added: usize,
+    /// Its feeds that were yours already.
+    pub known: usize,
+    /// Categories made for its folders.
+    pub categories: usize,
+    /// Feeds left out: over [`MAX_FEEDS`].
+    pub over: usize,
+    /// Folders no category was made for: over [`MAX_CATEGORIES`]. Their
+    /// feeds go under Feeds.
+    pub folders_over: usize,
+}
+
 impl FeedRow {
     /// Its name, or its address's host while it has none.
     pub fn name(&self) -> String {
         if !self.title.is_empty() {
             return self.title.clone();
         }
-        reqwest::Url::parse(&self.url)
-            .ok()
-            .and_then(|u| {
-                u.host_str()
-                    .map(|h| h.trim_start_matches("www.").to_string())
-            })
-            .unwrap_or_else(|| self.url.clone())
+        host_name(&self.url).unwrap_or_else(|| self.url.clone())
     }
+}
+
+/// The host of `url`, without `www.`: what stands for a feed's name while
+/// it has none.
+pub fn host_name(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()?
+        .host_str()
+        .map(|h| h.trim_start_matches("www.").to_string())
 }
 
 /// Which articles a view lists.
@@ -162,6 +185,10 @@ pub enum Listing {
 
 pub struct Store {
     db: Connection,
+    /// Articles whose title holds one of these aren't counted unread: the
+    /// views leave them out ([`Store::hide`]). Those of them kept are in
+    /// the connection's own `temp.hidden`, so counting needs no titles.
+    hidden: Blocks,
 }
 
 const COLUMNS: &str = "a.id, a.feed_id, f.id IS NOT NULL, a.source, a.link, a.title, a.summary, \
@@ -204,10 +231,20 @@ impl Store {
         db.execute_batch(SCHEMA)
             .with_context(|| format!("cannot set up {shown}"))?;
         migrate(&db).with_context(|| format!("cannot update {shown}"))?;
+        date_links(&db).with_context(|| format!("cannot update {shown}"))?;
         // The data folder is already yours alone; this is for a copy of the
         // database moved out of it.
         protect(path);
-        Ok(Self { db })
+        Self::with(db).with_context(|| format!("cannot set up {shown}"))
+    }
+
+    /// The store over `db`, set up: what this connection keeps for itself.
+    fn with(db: Connection) -> Result<Self> {
+        db.execute_batch("CREATE TEMP TABLE IF NOT EXISTS hidden (article_id TEXT PRIMARY KEY);")?;
+        Ok(Self {
+            db,
+            hidden: Blocks::default(),
+        })
     }
 
     #[cfg(test)]
@@ -215,12 +252,13 @@ impl Store {
         let db = Connection::open_in_memory().expect("SQLite opens in memory");
         db.execute_batch(SCHEMA).expect("the schema is valid");
         migrate(&db).expect("a new database is at the latest version");
-        Self { db }
+        Self::with(db).expect("a temporary table can be made")
     }
 
     /// Puts the default feeds in, and the default categories with their
     /// sections, each the first time only: what you remove doesn't come
-    /// back. Whether the feeds went in.
+    /// back. Whether the feeds went in. On a first start, once you say so
+    /// (`App.welcome`); after, for a database from before categories.
     pub fn seed_defaults(&mut self) -> Result<bool> {
         let tx = self.db.transaction()?;
         let done = |key: &str| -> Result<bool> {
@@ -250,15 +288,56 @@ impl Store {
         Ok(!feeds_seeded)
     }
 
+    /// Whether nothing was ever put in: a new database, or one whose first
+    /// start ended before you said what to start with (`App.welcome`).
+    pub fn is_new(&self) -> Result<bool> {
+        let seeded = self
+            .db
+            .prepare("SELECT 1 FROM meta WHERE key = 'seeded'")?
+            .exists([])?;
+        Ok(!seeded)
+    }
+
+    /// Starts with no feeds and no categories: the defaults never go in.
+    pub fn start_empty(&mut self) -> Result<()> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO meta (key, value)
+             VALUES ('seeded', '1'), ('categories_seeded', '1')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Articles whose title holds one of `blocks` aren't counted unread:
+    /// those kept are found now, those to come as they come.
+    pub fn hide(&mut self, blocks: Blocks) -> Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute("DELETE FROM temp.hidden", [])?;
+        if !blocks.is_empty() {
+            let mut titles = tx.prepare("SELECT id, title FROM articles")?;
+            let mut hide = tx.prepare("INSERT OR IGNORE INTO temp.hidden VALUES (?1)")?;
+            let rows =
+                titles.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (id, title) = row?;
+                if blocks.hides(&article::one_line(&title, article::MAX_TITLE)) {
+                    hide.execute([id])?;
+                }
+            }
+        }
+        tx.commit()?;
+        // Only once they're all marked: articles to come are by these words.
+        self.hidden = blocks;
+        Ok(())
+    }
+
     /// Every feed, those only in categories too, in the sidebar's order,
-    /// with how many articles of each you haven't read.
+    /// with how many of the articles it shows you haven't read if it's
+    /// under Feeds (a section's count shows nowhere).
     pub fn feeds(&self) -> Result<Vec<FeedRow>> {
         let mut statement = self.db.prepare(
-            "SELECT f.id, f.url, f.title, f.fetched_at, f.etag, f.last_modified, f.error,
-                    (SELECT COUNT(*) FROM article_feeds af WHERE af.feed_id = f.id
-                        AND NOT EXISTS (SELECT 1 FROM read r WHERE r.article_id = af.article_id)),
-                    f.listed
-             FROM feeds f ORDER BY f.place, f.id",
+            "SELECT id, url, title, fetched_at, etag, last_modified, error, listed
+             FROM feeds ORDER BY place, id",
         )?;
         let rows = statement.query_map([], |row| {
             let url: String = row.get(1)?;
@@ -271,61 +350,76 @@ impl Store {
                 etag: row.get(4)?,
                 last_modified: row.get(5)?,
                 error: error.map(|e| article::one_line(&e, 200)),
-                unread: row.get::<_, i64>(7)?.max(0) as usize,
-                listed: row.get(8)?,
+                unread: 0,
+                listed: row.get(7)?,
             })
         })?;
         // A feed whose address no longer checks out is never fetched.
-        Ok(rows
+        let mut feeds: Vec<FeedRow> = rows
             .filter_map(Result::ok)
             .filter(|f| article::checked_link(&f.url, None).is_some())
-            .collect())
+            .collect();
+        for feed in feeds.iter_mut().filter(|f| f.listed) {
+            feed.unread = self.unread(&Listing::Feed(feed.id))?;
+        }
+        Ok(feeds)
     }
 
     /// Your categories, in the sidebar's order: their feeds, and how many of
-    /// their articles you haven't read (each once, if two of its feeds
-    /// brought it).
+    /// the articles each shows you haven't read (each once, if two of its
+    /// feeds brought it).
     pub fn categories(&self) -> Result<Vec<CategoryRow>> {
-        let mut statement = self.db.prepare(
-            "SELECT c.id, c.name,
-                    (SELECT COUNT(DISTINCT af.article_id) FROM article_feeds af
-                        JOIN category_feeds cf ON cf.feed_id = af.feed_id
-                        WHERE cf.category_id = c.id
-                        AND NOT EXISTS (SELECT 1 FROM read r WHERE r.article_id = af.article_id))
-             FROM categories c ORDER BY c.place, c.id",
-        )?;
-        let rows: Vec<(CategoryId, String, i64)> = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .filter_map(Result::ok)
-            .collect();
         let mut feeds = self.db.prepare(
             "SELECT feed_id FROM category_feeds WHERE category_id = ?1 ORDER BY feed_id",
         )?;
-        rows.into_iter()
-            .map(|(id, name, unread)| {
+        self.category_names()?
+            .into_iter()
+            .map(|(id, name)| {
                 let ids = feeds
                     .query_map([id], |row| row.get(0))?
                     .collect::<rusqlite::Result<Vec<FeedId>>>()?;
                 Ok(CategoryRow {
                     id,
-                    name: article::one_line(&name, MAX_CATEGORY_NAME),
+                    name,
                     feeds: ids,
-                    unread: unread.max(0) as usize,
+                    unread: self.unread(&Listing::Category(id))?,
                 })
             })
             .collect()
     }
 
+    /// Your categories' names, in the sidebar's order, without counting
+    /// what's in them.
+    fn category_names(&self) -> Result<Vec<(CategoryId, String)>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT id, name FROM categories ORDER BY place, id")?;
+        let rows = statement.query_map([], |row| {
+            let name: String = row.get(1)?;
+            Ok((row.get(0)?, article::one_line(&name, MAX_CATEGORY_NAME)))
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     /// How many of Home's articles you haven't read.
     pub fn home_unread(&self) -> Result<usize> {
-        let n: i64 = self.db.query_row(
-            "SELECT COUNT(DISTINCT af.article_id) FROM article_feeds af
-                JOIN feeds f ON f.id = af.feed_id
-                WHERE f.listed = 1
-                AND NOT EXISTS (SELECT 1 FROM read r WHERE r.article_id = af.article_id)",
-            [],
-            |r| r.get(0),
-        )?;
+        self.unread(&Listing::Home)
+    }
+
+    /// How many of the articles `listing` shows you haven't read, but those
+    /// a blocked word hides, as the view leaves them out.
+    fn unread(&self, listing: &Listing) -> Result<usize> {
+        let Some((newest, param)) = newest(listing) else {
+            return Ok(0);
+        };
+        let n: i64 = self
+            .db
+            .prepare_cached(&format!(
+                "SELECT COUNT(*) FROM ({newest}) w
+                 WHERE NOT EXISTS (SELECT 1 FROM read r WHERE r.article_id = w.article_id)
+                   AND NOT EXISTS (SELECT 1 FROM temp.hidden h WHERE h.article_id = w.article_id)"
+            ))?
+            .query_row(rusqlite::params_from_iter(param), |r| r.get(0))?;
         Ok(n.max(0) as usize)
     }
 
@@ -356,27 +450,97 @@ impl Store {
         if exists.is_some() {
             bail!("that feed is yours already");
         }
-        self.db.execute(
-            "INSERT INTO feeds (url, title, place, listed)
-             VALUES (?1, ?2, (SELECT COALESCE(MAX(place), -1) + 1 FROM feeds), ?3)",
-            params![url, article::one_line(title, article::MAX_SOURCE), listed],
-        )?;
-        Ok(self.db.last_insert_rowid())
+        insert_feed(&self.db, url, title, listed)
     }
 
     /// Puts a feed that was only a section in categories under Feeds and in
     /// Home, last, as a feed added is.
     pub fn list_feed(&self, id: FeedId) -> Result<()> {
-        let changed = self.db.execute(
-            "UPDATE feeds SET listed = 1,
-                    place = (SELECT COALESCE(MAX(place), -1) + 1 FROM feeds)
-             WHERE id = ?1",
-            [id],
-        )?;
+        let changed = list(&self.db, id)?;
         if changed == 0 {
             bail!("that feed is gone");
         }
         Ok(())
+    }
+
+    /// Adds an OPML file's folders as categories (yours by that name, in
+    /// any case, else new ones), then its feeds under Feeds and in Home, each
+    /// into its folder's category, all of them or none. A site's section, as
+    /// `opml::write` marks one, goes only into its category. One that's
+    /// yours already goes into the category too, and under Feeds if it was
+    /// only a section and isn't marked one. Nothing is fetched here: new
+    /// feeds are due at once.
+    pub fn import(&mut self, opml: &opml::Opml) -> Result<Imported> {
+        // Each's id, and whether it's under Feeds.
+        let mut ids: HashMap<String, (FeedId, bool)> = self
+            .db
+            .prepare("SELECT url, id, listed FROM feeds")?
+            .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut categories: HashMap<String, CategoryId> = self
+            .category_names()?
+            .into_iter()
+            .map(|(id, name)| (name.to_lowercase(), id))
+            .collect();
+        let mut done = Imported::default();
+        let tx = self.db.transaction()?;
+        // A folder once, though two have its name.
+        let mut no_room = HashSet::new();
+        for folder in &opml.folders {
+            let key = folder.to_lowercase();
+            if categories.contains_key(&key) {
+                continue;
+            }
+            if categories.len() >= MAX_CATEGORIES {
+                no_room.insert(key);
+                continue;
+            }
+            categories.insert(key, insert_category(&tx, folder)?);
+            done.categories += 1;
+        }
+        done.folders_over = no_room.len();
+        // A feed once, though it's in two folders.
+        let mut counted = HashSet::new();
+        let mut left_out = HashSet::new();
+        for outline in &opml.feeds {
+            let known = ids.get(&outline.url).copied();
+            if known.is_none() && ids.len() >= MAX_FEEDS {
+                left_out.insert(&outline.url);
+                continue;
+            }
+            let category = outline
+                .folder
+                .as_ref()
+                .and_then(|f| categories.get(&f.to_lowercase()).copied());
+            let id = match known {
+                Some((id, listed)) => {
+                    if counted.insert(id) {
+                        done.known += 1;
+                    }
+                    // A section of yours is in its categories already.
+                    if !listed && !outline.section {
+                        list(&tx, id)?;
+                        ids.insert(outline.url.clone(), (id, true));
+                    }
+                    id
+                }
+                None => {
+                    // A section with no category to go in would show nowhere.
+                    let listed = !(outline.section && category.is_some());
+                    let id = insert_feed(&tx, &outline.url, &outline.title, listed)?;
+                    ids.insert(outline.url.clone(), (id, listed));
+                    counted.insert(id);
+                    done.added += 1;
+                    id
+                }
+            };
+            if let Some(category) = category {
+                put_in(&tx, category, id)?;
+            }
+        }
+        done.over = left_out.len();
+        tx.commit()?;
+        Ok(done)
     }
 
     /// Removes a feed, from its categories too, and its articles but those
@@ -398,12 +562,7 @@ impl Store {
         if count as usize >= MAX_CATEGORIES {
             bail!("that's {MAX_CATEGORIES} categories already");
         }
-        self.db.execute(
-            "INSERT INTO categories (name, place)
-             VALUES (?1, (SELECT COALESCE(MAX(place), -1) + 1 FROM categories))",
-            [&name],
-        )?;
-        Ok(self.db.last_insert_rowid())
+        insert_category(&self.db, &name)
     }
 
     pub fn rename_category(&mut self, id: CategoryId, name: &str) -> Result<()> {
@@ -423,9 +582,9 @@ impl Store {
             bail!("a category needs a name");
         }
         let taken = self
-            .categories()?
+            .category_names()?
             .into_iter()
-            .any(|c| Some(c.id) != other_than && c.name.to_lowercase() == name.to_lowercase());
+            .any(|(id, n)| Some(id) != other_than && n.to_lowercase() == name.to_lowercase());
         if taken {
             bail!("there's a category called that already");
         }
@@ -465,10 +624,7 @@ impl Store {
     ) -> Result<Option<String>> {
         let tx = self.db.transaction()?;
         let gone = if on {
-            tx.execute(
-                "INSERT OR IGNORE INTO category_feeds (category_id, feed_id) VALUES (?1, ?2)",
-                params![category, feed],
-            )?;
+            put_in(&tx, category, feed)?;
             None
         } else {
             tx.execute(
@@ -563,7 +719,8 @@ impl Store {
                 ],
             )?;
             tx.execute(
-                "INSERT OR IGNORE INTO article_feeds (article_id, feed_id) VALUES (?1, ?2)",
+                "INSERT OR IGNORE INTO article_feeds (article_id, feed_id, published)
+                 VALUES (?1, ?2, (SELECT published FROM articles WHERE id = ?1))",
                 params![id.as_str(), feed_id],
             )?;
             // The text the feed carries, as if read from its page.
@@ -573,9 +730,26 @@ impl Store {
                     params![id.as_str(), Block::encode(&item.body), now],
                 )?;
             }
+            let hidden = !self.hidden.is_empty()
+                && self
+                    .hidden
+                    .hides(&article::one_line(&item.title, article::MAX_TITLE));
+            if hidden {
+                tx.execute(
+                    "INSERT OR IGNORE INTO temp.hidden VALUES (?1)",
+                    [id.as_str()],
+                )?;
+            }
             if added > 0 {
                 new += 1;
                 continue;
+            }
+            // Its words are the feed's newer ones: hidden or not again.
+            if !hidden && !self.hidden.is_empty() {
+                tx.execute(
+                    "DELETE FROM temp.hidden WHERE article_id = ?1",
+                    [id.as_str()],
+                )?;
             }
             // A feed again for one whose feeds were all removed (kept as
             // saved, or in History): it says it's from this one now.
@@ -605,53 +779,26 @@ impl Store {
     /// The articles `listing` shows, in its order.
     pub fn articles(&self, listing: &Listing) -> Result<Vec<Article>> {
         let from = "FROM articles a LEFT JOIN feeds f ON f.id = a.feed_id";
-        let (sql, param): (String, Option<i64>) = match listing {
-            Listing::Home => (
-                format!(
-                    "SELECT {COLUMNS} {from} WHERE EXISTS (
-                        SELECT 1 FROM article_feeds af JOIN feeds lf ON lf.id = af.feed_id
-                        WHERE af.article_id = a.id AND lf.listed = 1)
-                     ORDER BY a.published DESC LIMIT {HOME_SIZE}"
-                ),
-                None,
-            ),
-            Listing::Feed(id) => (
-                format!(
-                    "SELECT {COLUMNS} {from} WHERE EXISTS (
-                        SELECT 1 FROM article_feeds af
-                        WHERE af.article_id = a.id AND af.feed_id = ?1)
-                     ORDER BY a.published DESC LIMIT {FEED_SIZE}"
-                ),
-                Some(*id),
-            ),
-            Listing::Category(id) => (
-                format!(
-                    "SELECT {COLUMNS} {from} WHERE EXISTS (
-                        SELECT 1 FROM article_feeds af
-                        JOIN category_feeds cf ON cf.feed_id = af.feed_id
-                        WHERE af.article_id = a.id AND cf.category_id = ?1)
-                     ORDER BY a.published DESC LIMIT {HOME_SIZE}"
-                ),
-                Some(*id),
-            ),
-            Listing::Saved => (
-                format!(
+        let (sql, param) = if let Some((newest, param)) = newest(listing) {
+            let sql = format!(
+                "SELECT {COLUMNS} {from} JOIN ({newest}) w ON w.article_id = a.id
+                 ORDER BY w.published DESC, w.article_id"
+            );
+            (sql, param)
+        } else {
+            let sql = match listing {
+                Listing::Saved => format!(
                     "SELECT {COLUMNS} {from} JOIN saved s ON s.article_id = a.id
                      ORDER BY s.at DESC"
                 ),
-                None,
-            ),
-            Listing::History => (
-                format!(
+                Listing::History => format!(
                     "SELECT {COLUMNS} {from} JOIN history h ON h.article_id = a.id
                      ORDER BY h.at DESC"
                 ),
-                None,
-            ),
-            Listing::Search(_) => (
-                format!("SELECT {COLUMNS} {from} ORDER BY a.published DESC LIMIT {SEARCHED}"),
-                None,
-            ),
+                // Search: the only other one.
+                _ => format!("SELECT {COLUMNS} {from} ORDER BY a.published DESC LIMIT {SEARCHED}"),
+            };
+            (sql, None)
         };
         let mut statement = self.db.prepare(&sql)?;
         let rows = match param {
@@ -788,11 +935,11 @@ impl Store {
         Ok(gone)
     }
 
-    /// Read marks, texts and links to feeds of articles no longer kept. How
-    /// many were.
+    /// Read marks, texts, links to feeds and hidden marks of articles no
+    /// longer kept. How many were.
     fn tidy(&self) -> Result<usize> {
         let mut gone = 0;
-        for table in ["read", "bodies", "article_feeds"] {
+        for table in ["read", "bodies", "article_feeds", "temp.hidden"] {
             gone += self.db.execute(
                 &format!("DELETE FROM {table} WHERE article_id NOT IN (SELECT id FROM articles)"),
                 [],
@@ -808,9 +955,28 @@ impl Store {
     }
 }
 
+/// Gives a link with no date its article's: a tuinews from before version 3
+/// that ran on this database since writes them so (it runs on it as it is).
+/// It puts its index back too, which says it was here.
+fn date_links(db: &Connection) -> Result<()> {
+    let older_was_here = db
+        .prepare("SELECT 1 FROM sqlite_master WHERE name = 'article_feeds_by_feed'")?
+        .exists([])?;
+    if older_was_here {
+        db.execute_batch(
+            "DROP INDEX article_feeds_by_feed;
+             UPDATE article_feeds SET published =
+                (SELECT published FROM articles WHERE id = article_feeds.article_id)
+             WHERE published = 0
+               AND EXISTS (SELECT 1 FROM articles WHERE id = article_feeds.article_id);",
+        )?;
+    }
+    Ok(())
+}
+
 /// Brings a database an earlier tuinews made up to [`VERSION`]: the
-/// `listed` column of feeds (all of an earlier one's are), and each article
-/// linked to the feed that brought it.
+/// `listed` column of feeds (all of an earlier one's are), each article
+/// linked to the feed that brought it, and its date beside each link.
 fn migrate(db: &Connection) -> Result<()> {
     let version: i64 = db
         .query_row(
@@ -823,18 +989,100 @@ fn migrate(db: &Connection) -> Result<()> {
     if version >= VERSION {
         return Ok(());
     }
-    let has_listed = db
-        .prepare("SELECT 1 FROM pragma_table_info('feeds') WHERE name = 'listed'")?
-        .exists([])?;
-    if !has_listed {
+    let has = |table: &str, column: &str| -> rusqlite::Result<bool> {
+        db.prepare(&format!(
+            "SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'"
+        ))?
+        .exists([])
+    };
+    if !has("feeds", "listed")? {
         db.execute_batch("ALTER TABLE feeds ADD COLUMN listed INTEGER NOT NULL DEFAULT 1;")?;
+    }
+    if !has("article_feeds", "published")? {
+        db.execute_batch(
+            "ALTER TABLE article_feeds ADD COLUMN published INTEGER NOT NULL DEFAULT 0;",
+        )?;
     }
     db.execute_batch(&format!(
         "INSERT OR IGNORE INTO article_feeds (article_id, feed_id)
             SELECT id, feed_id FROM articles WHERE feed_id IS NOT NULL;
+         UPDATE article_feeds SET published = COALESCE(
+            (SELECT published FROM articles WHERE id = article_feeds.article_id), 0);
+         DROP INDEX IF EXISTS article_feeds_by_feed;
+         CREATE INDEX IF NOT EXISTS article_feeds_by_date
+            ON article_feeds (feed_id, published DESC, article_id);
          INSERT OR REPLACE INTO meta (key, value) VALUES ('version', '{VERSION}');"
     ))?;
     Ok(())
+}
+
+/// The articles `listing` shows, if it's one of feeds' (Home, a feed's, a
+/// category's): its newest of them, each once, as `article_id` and
+/// `published`, and what `?1` is. A feed's come in order off the index by
+/// feed and date; Home's and a category's are those of their feeds, sorted.
+fn newest(listing: &Listing) -> Option<(String, Option<i64>)> {
+    // An article's rows all have its date, so DISTINCT keeps one of each
+    // (much faster than GROUP BY).
+    let of = |feeds: &str| {
+        format!(
+            "SELECT DISTINCT article_id, published FROM article_feeds
+             WHERE feed_id IN ({feeds})
+             ORDER BY published DESC, article_id LIMIT {HOME_SIZE}"
+        )
+    };
+    Some(match listing {
+        Listing::Home => (of("SELECT id FROM feeds WHERE listed = 1"), None),
+        Listing::Feed(id) => (
+            format!(
+                "SELECT article_id, published FROM article_feeds WHERE feed_id = ?1
+                 ORDER BY published DESC, article_id LIMIT {FEED_SIZE}"
+            ),
+            Some(*id),
+        ),
+        Listing::Category(id) => (
+            of("SELECT feed_id FROM category_feeds WHERE category_id = ?1"),
+            Some(*id),
+        ),
+        Listing::Saved | Listing::History | Listing::Search(_) => return None,
+    })
+}
+
+/// Puts a feed in, the last one. Its id.
+fn insert_feed(db: &Connection, url: &str, title: &str, listed: bool) -> Result<FeedId> {
+    db.execute(
+        "INSERT INTO feeds (url, title, place, listed)
+         VALUES (?1, ?2, (SELECT COALESCE(MAX(place), -1) + 1 FROM feeds), ?3)",
+        params![url, article::one_line(title, article::MAX_SOURCE), listed],
+    )?;
+    Ok(db.last_insert_rowid())
+}
+
+/// Makes a category, the last one. Its id.
+fn insert_category(db: &Connection, name: &str) -> Result<CategoryId> {
+    db.execute(
+        "INSERT INTO categories (name, place)
+         VALUES (?1, (SELECT COALESCE(MAX(place), -1) + 1 FROM categories))",
+        [name],
+    )?;
+    Ok(db.last_insert_rowid())
+}
+
+/// Puts a feed under Feeds and in Home, last, as a feed added is.
+fn list(db: &Connection, id: FeedId) -> rusqlite::Result<usize> {
+    db.execute(
+        "UPDATE feeds SET listed = 1,
+                place = (SELECT COALESCE(MAX(place), -1) + 1 FROM feeds)
+         WHERE id = ?1",
+        [id],
+    )
+}
+
+/// Puts a feed in a category, if it isn't in it yet.
+fn put_in(db: &Connection, category: CategoryId, feed: FeedId) -> rusqlite::Result<usize> {
+    db.execute(
+        "INSERT OR IGNORE INTO category_feeds (category_id, feed_id) VALUES (?1, ?2)",
+        params![category, feed],
+    )
 }
 
 /// The default categories and their sections. A section that's a feed of
@@ -842,12 +1090,7 @@ fn migrate(db: &Connection) -> Result<()> {
 /// isn't put back.
 fn seed_categories(tx: &rusqlite::Transaction) -> Result<()> {
     for category in &defaults::CATEGORIES {
-        tx.execute(
-            "INSERT INTO categories (name, place)
-             VALUES (?1, (SELECT COALESCE(MAX(place), -1) + 1 FROM categories))",
-            [category.name],
-        )?;
-        let id = tx.last_insert_rowid();
+        let id = insert_category(tx, category.name)?;
         let feed_id = |url: &str| -> rusqlite::Result<Option<FeedId>> {
             tx.query_row("SELECT id FROM feeds WHERE url = ?1", [url], |r| r.get(0))
                 .optional()
@@ -868,10 +1111,7 @@ fn seed_categories(tx: &rusqlite::Transaction) -> Result<()> {
             .chain(category.also.iter().copied())
         {
             if let Some(feed) = feed_id(url)? {
-                tx.execute(
-                    "INSERT OR IGNORE INTO category_feeds (category_id, feed_id) VALUES (?1, ?2)",
-                    params![id, feed],
-                )?;
+                put_in(tx, id, feed)?;
             }
         }
     }
@@ -1123,7 +1363,7 @@ mod tests {
         .unwrap();
         db.execute_batch(SCHEMA).unwrap();
         migrate(&db).unwrap();
-        let mut store = Store { db };
+        let mut store = Store::with(db).unwrap();
         assert!(
             !store.seed_defaults().unwrap(),
             "its feeds stay as they are"
@@ -1136,6 +1376,208 @@ mod tests {
             defaults::CATEGORIES.len()
         );
         migrate(&store.db).unwrap();
+    }
+
+    #[test]
+    fn links_an_older_tuinews_left_without_dates_get_them() {
+        let mut store = Store::in_memory();
+        let a = store.add_feed("https://e.vn/rss", "E", true).unwrap();
+        let b = store.add_feed("https://f.vn/rss", "F", true).unwrap();
+        store
+            .save_articles(a, "E", &[item(1, 10), item(2, 30)], 100)
+            .unwrap();
+        store.save_articles(b, "F", &[item(1, 10)], 100).unwrap();
+        // As an older tuinews leaves them: links without dates, and its index.
+        store
+            .db
+            .execute(
+                "UPDATE article_feeds SET published = 0 WHERE feed_id = ?1",
+                [b],
+            )
+            .unwrap();
+        store
+            .db
+            .execute_batch("CREATE INDEX article_feeds_by_feed ON article_feeds (feed_id);")
+            .unwrap();
+        date_links(&store.db).unwrap();
+        let titles: Vec<String> = store
+            .articles(&Listing::Home)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.title)
+            .collect();
+        assert_eq!(titles, ["Bài số 2", "Bài số 1"], "each once, by its date");
+    }
+
+    #[test]
+    fn a_version_2_database_gets_dates_beside_its_links() {
+        let mut store = Store::in_memory();
+        let feed = store.add_feed("https://e.vn/rss", "E", true).unwrap();
+        store
+            .save_articles(feed, "E", &[item(1, 10), item(2, 30), item(3, 20)], 100)
+            .unwrap();
+        // As version 2 left it: the links without dates, indexed by feed.
+        store
+            .db
+            .execute_batch(
+                "DROP INDEX article_feeds_by_date;
+                 ALTER TABLE article_feeds DROP COLUMN published;
+                 CREATE INDEX article_feeds_by_feed ON article_feeds (feed_id);
+                 UPDATE meta SET value = '2' WHERE key = 'version';",
+            )
+            .unwrap();
+        migrate(&store.db).unwrap();
+        let titles: Vec<String> = store
+            .articles(&Listing::Feed(feed))
+            .unwrap()
+            .into_iter()
+            .map(|a| a.title)
+            .collect();
+        assert_eq!(titles, ["Bài số 2", "Bài số 3", "Bài số 1"]);
+        assert_eq!(store.home_unread().unwrap(), 3);
+        let old_index = store
+            .db
+            .prepare("SELECT 1 FROM sqlite_master WHERE name = 'article_feeds_by_feed'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!old_index);
+    }
+
+    #[test]
+    fn unread_counts_count_what_each_view_shows() {
+        let mut store = Store::in_memory();
+        let feed = store.add_feed("https://e.vn/rss", "E", true).unwrap();
+        let category = store.add_category("Tin").unwrap();
+        store.set_in_category(category, feed, true).unwrap();
+        let n = HOME_SIZE + 10;
+        let mut items: Vec<feed::Item> = (0..n as u32).map(|i| item(i, i64::from(i))).collect();
+        items[n - 1].title = "Showbiz: tin mới nhất".into();
+        store.save_articles(feed, "E", &items, 1_000_000).unwrap();
+        let home = store.articles(&Listing::Home).unwrap();
+        assert_eq!(home.len(), HOME_SIZE);
+        assert_eq!(home[0].title, "Showbiz: tin mới nhất");
+        assert_eq!(
+            store.home_unread().unwrap(),
+            HOME_SIZE,
+            "not those it doesn't show"
+        );
+        assert_eq!(store.feeds().unwrap()[0].unread, FEED_SIZE);
+        assert_eq!(store.categories().unwrap()[0].unread, HOME_SIZE);
+        store.mark_read(&[home[1].id.clone()], 1).unwrap();
+        assert_eq!(store.home_unread().unwrap(), HOME_SIZE - 1);
+        let settings = crate::settings::Settings {
+            blocked_words: vec!["showbiz".into()],
+            ..crate::settings::Settings::default()
+        };
+        store.hide(settings.blocks()).unwrap();
+        assert_eq!(
+            store.home_unread().unwrap(),
+            HOME_SIZE - 2,
+            "nor what's hidden"
+        );
+        assert_eq!(store.feeds().unwrap()[0].unread, FEED_SIZE - 2);
+        // One that comes in after, hidden too; it pushes an older one out.
+        let mut newer = item(n as u32, n as i64);
+        newer.title = "Showbiz: tin sau".into();
+        store.save_articles(feed, "E", &[newer], 1_000_000).unwrap();
+        assert_eq!(store.home_unread().unwrap(), HOME_SIZE - 3);
+    }
+
+    #[test]
+    fn a_new_database_is_new_till_you_say_what_to_start_with() {
+        let mut store = Store::in_memory();
+        assert!(store.is_new().unwrap());
+        store.start_empty().unwrap();
+        assert!(!store.is_new().unwrap());
+        assert!(!store.seed_defaults().unwrap(), "the defaults never go in");
+        assert!(store.feeds().unwrap().is_empty());
+        assert!(store.categories().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_opml_files_feeds_and_folders_come_in_once() {
+        let mut store = Store::in_memory();
+        store.seed_defaults().unwrap();
+        let outline = |url: &str, title: &str, folder: Option<&str>| opml::Outline {
+            url: url.into(),
+            title: title.into(),
+            folder: folder.map(Into::into),
+            section: false,
+        };
+        let bbc = "https://feeds.bbci.co.uk/news/rss.xml";
+        let section = "https://vnexpress.net/rss/oto-xe-may.rss";
+        let feeds = [
+            outline(bbc, "BBC", Some("world")),
+            outline(bbc, "BBC", Some("Reading")),
+            outline(section, "VnExpress Xe", None),
+            outline(
+                "https://news.ycombinator.com/rss",
+                "Hacker News",
+                Some("Reading"),
+            ),
+        ];
+        let file = opml::Opml {
+            feeds: feeds.to_vec(),
+            folders: vec!["world".into(), "Reading".into(), "Later".into()],
+            skipped: 0,
+        };
+        let done = store.import(&file).unwrap();
+        let wanted = Imported {
+            added: 2,
+            known: 1,
+            categories: 2,
+            over: 0,
+            folders_over: 0,
+        };
+        assert_eq!(done, wanted);
+        let all = store.feeds().unwrap();
+        let bbc = all.iter().find(|f| f.url == bbc).unwrap();
+        assert_eq!(bbc.title, "BBC");
+        assert!(bbc.listed);
+        let section = all.iter().find(|f| f.url == section).unwrap();
+        assert!(section.listed, "a section of yours, under Feeds now");
+        let categories = store.categories().unwrap();
+        let in_category = |name: &str| {
+            categories
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap()
+                .feeds
+                .clone()
+        };
+        assert!(in_category("World").contains(&bbc.id), "yours, in any case");
+        assert_eq!(in_category("Reading").len(), 2);
+        assert!(in_category("Later").is_empty(), "an empty folder too");
+        let again = store.import(&file).unwrap();
+        assert_eq!((again.added, again.known, again.categories), (0, 3, 0));
+
+        let mut store = Store::in_memory();
+        let many = opml::Opml {
+            feeds: (0..MAX_FEEDS + 3)
+                .map(|n| outline(&format!("https://e{n}.example/rss"), "", None))
+                .collect(),
+            ..opml::Opml::default()
+        };
+        let done = store.import(&many).unwrap();
+        assert_eq!((done.added, done.over), (MAX_FEEDS, 3));
+
+        // No room for a folder's category: its section goes under Feeds,
+        // where it shows.
+        let mut store = Store::in_memory();
+        for n in 0..MAX_CATEGORIES {
+            store.add_category(&format!("C{n}")).unwrap();
+        }
+        let mut section = outline("https://e.example/rss", "E", Some("Tech"));
+        section.section = true;
+        let file = opml::Opml {
+            feeds: vec![section],
+            folders: vec!["Tech".into(), "tech".into()],
+            skipped: 0,
+        };
+        let done = store.import(&file).unwrap();
+        assert_eq!((done.added, done.folders_over), (1, 1));
+        assert!(store.feeds().unwrap()[0].listed);
     }
 
     #[test]

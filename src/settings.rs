@@ -221,11 +221,20 @@ pub struct Blocks {
 impl Blocks {
     /// Whether `article`'s title holds a blocked word.
     pub fn hold(&self, article: &Article) -> bool {
+        self.hides(&article.title)
+    }
+
+    /// Whether `title` holds a blocked word.
+    pub fn hides(&self, title: &str) -> bool {
         if self.words.is_empty() {
             return false;
         }
-        let title = article.title.to_lowercase();
+        let title = title.to_lowercase();
         self.words.iter().any(|word| holds_word(&title, word))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
     }
 }
 

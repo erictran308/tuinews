@@ -1009,38 +1009,49 @@ mod tests {
             else {
                 panic!("{}: no feed", default.name);
             };
-            let item = &feed.items[0];
-            let blocks = if item.body.is_empty() {
-                match page(&client, &item.link).await {
-                    Ok(page) => html::article_text(&page, &item.link),
-                    Err(e) => {
-                        missing.push(format!("{}: {e:#}", default.name));
-                        continue;
+            // The newest may have no text (a video: Tiền Phong's short
+            // ones), so the first of the three newest with text counts.
+            let mut tried = Vec::new();
+            let mut found = false;
+            for item in feed.items.iter().take(3) {
+                let blocks = if item.body.is_empty() {
+                    match page(&client, &item.link).await {
+                        Ok(page) => html::article_text(&page, &item.link),
+                        Err(e) => {
+                            tried.push(format!("{e:#} at {}", item.link));
+                            continue;
+                        }
                     }
+                } else {
+                    item.body.clone()
+                };
+                let length: usize = blocks.iter().map(|b| b.text().chars().count()).sum();
+                if length < 300 {
+                    tried.push(format!("{length} chars at {}", item.link));
+                    continue;
                 }
-            } else {
-                item.body.clone()
-            };
-            let length: usize = blocks.iter().map(|b| b.text().chars().count()).sum();
-            let pictures = blocks
-                .iter()
-                .filter(|b| matches!(b, Block::Picture(_)))
-                .count();
-            let first = blocks
-                .iter()
-                .map(Block::text)
-                .find(|t| !t.is_empty())
-                .unwrap_or_default();
-            println!(
-                "{:<24} {:>3} blocks {:>2} pictures {:>6} chars  {}",
-                default.name,
-                blocks.len(),
-                pictures,
-                length,
-                crate::text::first_chars(first, 50)
-            );
-            if length < 300 {
-                missing.push(format!("{}: {length} chars at {}", default.name, item.link));
+                let pictures = blocks
+                    .iter()
+                    .filter(|b| matches!(b, Block::Picture(_)))
+                    .count();
+                let first = blocks
+                    .iter()
+                    .map(Block::text)
+                    .find(|t| !t.is_empty())
+                    .unwrap_or_default();
+                println!(
+                    "{:<24} {:>3} blocks {:>2} pictures {:>6} chars  {}",
+                    default.name,
+                    blocks.len(),
+                    pictures,
+                    length,
+                    crate::text::first_chars(first, 50)
+                );
+                found = true;
+                break;
+            }
+            if !found {
+                missing.push(format!("{}: {tried:?}", default.name));
             }
         }
         assert!(missing.is_empty(), "{missing:#?}");

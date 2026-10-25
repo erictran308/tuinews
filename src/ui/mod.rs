@@ -24,6 +24,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Confirm, Focus, HelpMenu, HelpTab, Kept, Naming, PromptKind, View};
+use crate::defaults;
 use crate::settings::Settings;
 use crate::theme::{self, Colors};
 use crate::typed::Typed;
@@ -87,6 +88,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.confirm.is_some() {
         confirm(frame, app, area);
     }
+    if app.welcome {
+        welcome(frame, app, area);
+    }
     if let Some(splash) = &app.splash {
         // Over all of it: what the frame drew has asked for its pictures.
         app.effects.popups.get_mut().clear();
@@ -146,7 +150,6 @@ const MAX_CONFIRM: usize = 60;
 /// The question waiting for `y`, in a popup in the middle: what it does,
 /// and the keys.
 fn confirm(frame: &mut Frame, app: &App, area: Rect) {
-    let c = &app.colors;
     let Some(confirm) = &app.confirm else {
         return;
     };
@@ -178,20 +181,64 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
         }
         Confirm::MarkAllRead(ids) => {
             let n = ids.len();
-            let articles = if n == 1 { "article" } else { "articles" };
+            let articles = plural(n, "unread article", "unread articles");
             (
                 " Mark all read? ".to_string(),
                 format!(
-                    "The {n} unread {articles} shown here are marked read. m on one marks it unread again."
+                    "The {articles} shown here are marked read. m on one marks it unread again."
                 ),
                 " `y` mark them read · any other key doesn't ",
             )
         }
     };
+    question(frame, app, area, &title, &[text], hint);
+}
+
+/// The first start's question (`App.welcome`): Vietnam's news sites, or
+/// no feeds.
+fn welcome(frame: &mut Frame, app: &App, area: Rect) {
+    let sites: Vec<&str> = defaults::FEEDS.iter().map(|f| f.name).take(4).collect();
+    let categories: Vec<&str> = defaults::CATEGORIES
+        .iter()
+        .map(|c| c.name)
+        .take(4)
+        .collect();
+    let text = [
+        format!(
+            "Start with Vietnam's biggest news sites? {} and {} more, and {} categories made of their sections: {}…",
+            sites.join(", "),
+            defaults::FEEDS.len() - sites.len(),
+            defaults::CATEGORIES.len(),
+            categories.join(", "),
+        ),
+        "Or start with no feeds, and add your own: a feed's address, a site's, or the OPML file another reader exports.".into(),
+    ];
+    question(
+        frame,
+        app,
+        area,
+        " Welcome to tuinews ",
+        &text,
+        " `y` Vietnam's news · `n` no feeds · `q` quit ",
+    );
+}
+
+/// A question in a popup in the middle: what it's about, a blank line
+/// between paragraphs, and its keys.
+fn question(frame: &mut Frame, app: &App, area: Rect, title: &str, text: &[String], hint: &str) {
+    let c = &app.colors;
     let hint_width = hint.replace('`', "").width();
     let fits = (MAX_CONFIRM.max(hint_width).max(title.width()) + 6).min(usize::from(area.width));
-    // A long title goes on more lines, not across the screen.
-    let lines = wrap(&text, fits.saturating_sub(4).max(1));
+    // Long text goes on more lines, not across the screen.
+    let lines: Vec<String> = text
+        .iter()
+        .enumerate()
+        .flat_map(|(i, paragraph)| {
+            let gap = (i > 0).then(String::new);
+            gap.into_iter()
+                .chain(wrap(paragraph, fits.saturating_sub(4).max(1)))
+        })
+        .collect();
     let widest = lines.iter().map(|l| l.width()).max().unwrap_or(0);
     let width = (widest.max(hint_width).max(title.width()) + 6).min(usize::from(area.width));
     let height = (lines.len() as u16 + 4).min(area.height);
@@ -349,6 +396,11 @@ fn with_cursor(typed: &Typed, room: usize, c: &Colors) -> Vec<Span<'static>> {
     ]
 }
 
+/// `n` and what it counts: "1 feed", "3 feeds".
+pub fn plural(n: usize, one: &str, more: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { more })
+}
+
 /// `text` in rows at most `width` columns wide, broken between words (a
 /// word wider than a row is broken where it must be).
 pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -477,10 +529,9 @@ pub(super) fn search_box(app: &App, width: u16, right: u16, line: Style) -> Line
 fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let c = &app.colors;
     let width = area.width as usize;
-    let feeds = app.listed().count();
     let right = format!(
-        " {feeds} feed{} · {} unread ",
-        if feeds == 1 { "" } else { "s" },
+        " {} · {} unread ",
+        plural(app.listed().count(), "feed", "feeds"),
         app.home_unread
     );
     let room = width.saturating_sub(right.width());
@@ -491,7 +542,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     " `Enter` search · `Ctrl-j` articles · `Esc` cancel · `Ctrl-u` delete before · without accents finds them too · `←→` move"
                 }
                 PromptKind::AddFeed => {
-                    " Type or paste a feed's address, or a site's · `Enter` add · `Esc` cancel · `Ctrl-u` delete before · `←→` move"
+                    " Type or paste a feed's address, a site's, or an OPML file's path · `Enter` add · `Esc` cancel · `Ctrl-u` delete before · `←→` move"
                 }
             };
             hints_fitting(keys, room, c)
@@ -563,7 +614,7 @@ const HELP: [(&str, &str); 33] = [
     ),
     (
         "a",
-        "add a feed: its address, or a site's; in a category, into it",
+        "add a feed (its address, a site's) or an OPML file; in a category, into it",
     ),
     ("R", "fetch every feed now"),
     ("Backspace  Ctrl-o", "back"),
@@ -797,8 +848,7 @@ fn header_spans(app: &App, width: usize) -> Vec<Span<'static>> {
     let c = &app.colors;
     let count = match app.articles.len() {
         0 => String::new(),
-        1 => "  1 article".into(),
-        n => format!("  {n} articles"),
+        n => format!("  {}", plural(n, "article", "articles")),
     };
     let mut spans = vec![
         Span::styled(
@@ -829,7 +879,7 @@ fn header_spans(app: &App, width: usize) -> Vec<Span<'static>> {
     {
         let n = category.feeds.len();
         spans.push(Span::styled(
-            format!("  ·  from {n} feed{}", if n == 1 { "" } else { "s" }),
+            format!("  ·  from {}", plural(n, "feed", "feeds")),
             Style::new().fg(c.dim),
         ));
     }
@@ -951,7 +1001,7 @@ fn category_menu(frame: &mut Frame, app: &mut App, area: Rect) {
                     Style::new().fg(c.text),
                 ));
                 spans.push(Span::styled(
-                    format!("  {n} feed{}", if n == 1 { "" } else { "s" }),
+                    format!("  {}", plural(n, "feed", "feeds")),
                     Style::new().fg(c.dim),
                 ));
             }
@@ -1052,6 +1102,20 @@ mod tests {
             assert!(shown.contains(&format!("Tin số {n}")), "{shown}");
         }
         assert!(shown.contains("VnExpress ·"), "{shown}");
+    }
+
+    #[test]
+    fn a_first_start_asks_what_to_start_with() {
+        let mut app = crate::app::tests::new_app();
+        let shown = screen(&mut app, 120, 30);
+        assert!(shown.contains("Welcome to tuinews"), "{shown}");
+        assert!(shown.contains("VnExpress, Tuổi Trẻ"), "{shown}");
+        assert!(shown.contains("Or start with no feeds"), "{shown}");
+        assert!(
+            shown.contains("y Vietnam's news · n no feeds · q quit"),
+            "{shown}"
+        );
+        assert!(shown.contains("No feeds"), "Home behind it: {shown}");
     }
 
     #[test]

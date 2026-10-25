@@ -22,6 +22,11 @@ pub const MAX_PAGE: usize = 5 * 1024 * 1024;
 /// A paragraph shorter than this doesn't count when looking for where the
 /// text is: a menu's items, a date, a caption.
 const MIN_COUNTED: usize = 40;
+/// Elements above one looked at, at most, to say whether it's in a menu, a
+/// box of links or a link: pages nest some 30 deep. Deeper than this, it's
+/// taken to be in one ([`near`]), and a page nested thousands deep doesn't
+/// make each look take long.
+const MAX_ANCESTORS: usize = 256;
 
 /// Elements whose text is never anyone's to read: code, styles, forms and
 /// the like, and lists, which in a feed's summary are links to other
@@ -92,9 +97,21 @@ fn holds_entity(text: &str) -> bool {
 }
 
 /// Writes the text under `node` into `out`, a line break after each block,
-/// leaving out [`SKIPPED`] elements and those in `also`.
+/// leaving out [`SKIPPED`] elements and those in `also`. With a stack, not
+/// recursion: a feed or a page may nest elements deeper than a thread's
+/// stack goes.
 fn text_into(node: NodeRef<Node>, out: &mut String, also: &[&str]) {
-    for child in node.children() {
+    enum Step<'a> {
+        Into(NodeRef<'a, Node>),
+        /// A block's end.
+        Out,
+    }
+    let mut steps: Vec<Step> = node.children().rev().map(Step::Into).collect();
+    while let Some(step) = steps.pop() {
+        let Step::Into(child) = step else {
+            out.push('\n');
+            continue;
+        };
         match child.value() {
             Node::Text(text) => out.push_str(text),
             Node::Element(element) => {
@@ -102,14 +119,13 @@ fn text_into(node: NodeRef<Node>, out: &mut String, also: &[&str]) {
                 if SKIPPED.contains(&name) || also.contains(&name) {
                     continue;
                 }
-                let block = BLOCKS.contains(&name);
-                if block && !out.ends_with('\n') && !out.is_empty() {
-                    out.push('\n');
+                if BLOCKS.contains(&name) {
+                    if !out.ends_with('\n') && !out.is_empty() {
+                        out.push('\n');
+                    }
+                    steps.push(Step::Out);
                 }
-                text_into(child, out, also);
-                if block {
-                    out.push('\n');
-                }
+                steps.extend(child.children().rev().map(Step::Into));
             }
             _ => {}
         }
@@ -317,11 +333,13 @@ pub fn article_text(page: &str, base: &str) -> Vec<Block> {
             _ => continue,
         };
         // Once only: a paragraph in a quote or a list item is the quote's.
-        let nested = element
-            .ancestors()
-            .take_while(|a| a.id() != best.id())
-            .filter_map(ElementRef::wrap)
-            .any(|a| matches!(a.value().name(), "p" | "li" | "blockquote" | "figcaption"));
+        let nested = near(
+            element
+                .ancestors()
+                .take_while(|a| a.id() != best.id())
+                .filter_map(ElementRef::wrap),
+            |a| matches!(a.value().name(), "p" | "li" | "blockquote" | "figcaption"),
+        );
         if nested || outside_article(&element) || marked_aside(&element, &best) {
             continue;
         }
@@ -372,13 +390,14 @@ fn picture_of(img: &ElementRef, container: &ElementRef, base: &str) -> Option<St
     if path.ends_with(".svg") || NOT_PICTURE.iter().any(|word| path.contains(word)) {
         return None;
     }
-    let to_elsewhere = img
-        .ancestors()
-        .take_while(|a| a.id() != container.id())
-        .filter_map(ElementRef::wrap)
-        .filter(|a| a.value().name() == "a")
-        .filter_map(|a| a.attr("href"))
-        .any(|href| {
+    let to_elsewhere = near(
+        img.ancestors()
+            .take_while(|a| a.id() != container.id())
+            .filter_map(ElementRef::wrap),
+        |a| {
+            let Some(href) = (a.value().name() == "a").then(|| a.attr("href")).flatten() else {
+                return false;
+            };
             let href = href.trim().to_ascii_lowercase();
             let page = href.split('?').next().unwrap_or_default();
             !(href.is_empty()
@@ -387,7 +406,8 @@ fn picture_of(img: &ElementRef, container: &ElementRef, base: &str) -> Option<St
                 || [".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"]
                     .iter()
                     .any(|ext| page.ends_with(ext)))
-        });
+        },
+    );
     if to_elsewhere {
         return None;
     }
@@ -405,13 +425,15 @@ fn words_of(element: &ElementRef) -> String {
 /// menu, a header or footer, a form, or something [`SKIPPED`]. The page's
 /// `body` and what's above it don't count.
 fn outside_article(element: &ElementRef) -> bool {
-    std::iter::once(*element)
-        .chain(element.ancestors().filter_map(ElementRef::wrap))
-        .take_while(|e| !matches!(e.value().name(), "body" | "html"))
-        .any(|e| {
+    near(
+        std::iter::once(*element)
+            .chain(element.ancestors().filter_map(ElementRef::wrap))
+            .take_while(|e| !matches!(e.value().name(), "body" | "html")),
+        |e| {
             let name = e.value().name();
             NOT_ARTICLE.contains(&name) || SKIPPED.contains(&name)
-        })
+        },
+    )
 }
 
 /// Whether `element`, inside the article's `container`, is marked as what
@@ -419,10 +441,11 @@ fn outside_article(element: &ElementRef) -> bool {
 /// related links, a box of sharing buttons. Only what's inside counts: a
 /// site's whole column can be called `sidebar-1` (VnExpress's is).
 fn marked_aside(element: &ElementRef, container: &ElementRef) -> bool {
-    std::iter::once(*element)
-        .chain(element.ancestors().filter_map(ElementRef::wrap))
-        .take_while(|e| e.id() != container.id())
-        .any(|e| {
+    near(
+        std::iter::once(*element)
+            .chain(element.ancestors().filter_map(ElementRef::wrap))
+            .take_while(|e| e.id() != container.id()),
+        |e| {
             let value = e.value();
             let marks = [value.attr("class"), value.attr("id")]
                 .into_iter()
@@ -431,12 +454,41 @@ fn marked_aside(element: &ElementRef, container: &ElementRef) -> bool {
                 .collect::<Vec<_>>()
                 .join(" ");
             NOT_TEXT.iter().any(|word| marks.contains(word))
-        })
+        },
+    )
+}
+
+/// Whether `found` holds for one of the first [`MAX_ANCESTORS`] elements of
+/// `walk` (an element and those above it), or the walk goes further: what's
+/// nested that deep is taken to be in what's looked for, so it's left out.
+fn near<'a>(
+    walk: impl Iterator<Item = ElementRef<'a>>,
+    mut found: impl FnMut(&ElementRef<'a>) -> bool,
+) -> bool {
+    walk.take(MAX_ANCESTORS + 1)
+        .enumerate()
+        .any(|(i, e)| i == MAX_ANCESTORS || found(&e))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elements_nested_deeper_than_a_stack_goes_are_read_or_left_out() {
+        let deep = format!("{}x{}", "<span>".repeat(200_000), "</span>".repeat(200_000));
+        assert_eq!(summary(&deep), "x");
+        let page = |depth: usize| {
+            format!(
+                "<html><body><article>{}<p>{}</p></article></body></html>",
+                "<span>".repeat(depth),
+                "Đoạn văn đủ dài để được tính là văn bản của bài viết này. ".repeat(3)
+            )
+        };
+        assert!(!article_text(&page(200), "https://e.vn/a").is_empty());
+        // Deeper than pages go, it's taken to be no article's text.
+        assert!(article_text(&page(100_000), "https://e.vn/a").is_empty());
+    }
 
     #[test]
     fn a_summary_is_its_text_without_pictures_or_related_links() {
