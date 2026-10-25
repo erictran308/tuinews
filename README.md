@@ -96,12 +96,14 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `x` | Take the article off Saved or History; in the sidebar, remove the feed or delete the category. Each asks first: `y` does it, any other key doesn't |
 | `F` | Categories: put the feed (the sidebar's, or the article's) in some or take it out (`Enter`), make one (`n`), rename one (`r`) or delete one (`x`, after you press `y`) |
 | `v` | A list (two rows an article, no pictures) or cards |
-| `/` or `s` | Search your articles (`Enter` searches, `Esc` cancels, `Ctrl-u` clears) |
+| `/` or `s` | Search your articles (`Enter` searches, `Esc` cancels) |
 | `a` | Add a feed: its address, or a site's that names one; in a category, into it (and only there). A link pasted with no box open goes in this box |
 | `R` | Fetch every feed now |
 | `Backspace` / `Ctrl-o` | Back to the view before |
 | `?` / `O` | Every key / the settings |
 | `q` | Quit (in the reader, back to the articles) |
+
+In a box you type in (a search, a feed's address, a category's name): `←` `→` move a letter, `Option` / `Alt` with them a word, `Home` / `End` or `Cmd-←` / `Cmd-→` (`Ctrl-a` / `Ctrl-e`) to either end; `Backspace` and `Delete` delete a letter, `Ctrl-w` or `Option-Backspace` the word before, `Ctrl-u` or `Cmd-Backspace` all before.
 
 In the reader: `j k` scroll a line, `Space` / `b` a page, `g` / `G` the top and the end, `]` / `[` the next article and the one before, `o` or `Enter` the browser, `w` save, `m` unread, `y` copy the link, `Esc`, `q` or `Backspace` back.
 

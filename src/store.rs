@@ -365,11 +365,14 @@ impl Store {
     }
 
     /// Puts a feed that was only a section in categories under Feeds and in
-    /// Home.
+    /// Home, last, as a feed added is.
     pub fn list_feed(&self, id: FeedId) -> Result<()> {
-        let changed = self
-            .db
-            .execute("UPDATE feeds SET listed = 1 WHERE id = ?1", [id])?;
+        let changed = self.db.execute(
+            "UPDATE feeds SET listed = 1,
+                    place = (SELECT COALESCE(MAX(place), -1) + 1 FROM feeds)
+             WHERE id = ?1",
+            [id],
+        )?;
         if changed == 0 {
             bail!("that feed is gone");
         }

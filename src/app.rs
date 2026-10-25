@@ -17,6 +17,8 @@ use futures::StreamExt;
 use ratatui::DefaultTerminal;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use unicode_normalization::char::is_combining_mark;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::article::{self, Article, ArticleId, FeedId};
 use crate::feed::{self, Fetched};
@@ -159,7 +161,154 @@ pub enum PromptKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prompt {
     pub kind: PromptKind,
-    pub text: String,
+    pub typed: Typed,
+}
+
+impl Prompt {
+    pub fn new(kind: PromptKind, typed: Typed) -> Self {
+        Self { kind, typed }
+    }
+}
+
+/// What's typed in a box (a search, a feed's address, a category's name),
+/// and where its cursor is: always between two letters as drawn, since only
+/// [`Typed::edit`] and [`Typed::paste`] change them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Typed {
+    text: String,
+    /// Where typing goes: a byte offset in `text`.
+    cursor: usize,
+}
+
+impl Typed {
+    /// `text`, the cursor at its end.
+    pub fn new(text: String) -> Self {
+        let cursor = text.len();
+        Self { text, cursor }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Where typing goes: a byte offset in [`Typed::text`].
+    pub fn at(&self) -> usize {
+        self.cursor
+    }
+
+    /// Edits with `key`, at the cursor (moved as it goes). Backspace, or
+    /// Ctrl-h, which some terminals send for it, deletes the letter before
+    /// it (an accent written apart first, as an input method that retypes a
+    /// letter expects), Delete the letter after it, Ctrl-w or Alt-Backspace
+    /// the word before it, and Ctrl-u all before it (what Cmd-Backspace
+    /// sends). ← and → move it a letter; with Alt (or Alt-b and Alt-f, what
+    /// macOS's Option-← and Option-→ send), a word; Home and End, or Ctrl-a
+    /// and Ctrl-e (Cmd-← and Cmd-→), to either end; Ctrl with an arrow is
+    /// the panes'. A character that shows goes in at it, typed with AltGr too
+    /// (Ctrl and Alt, as Windows says it), while the line holds fewer than
+    /// `max`.
+    pub fn edit(&mut self, key: &KeyEvent, max: usize) {
+        let altgr = key
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !altgr;
+        let alt = key.modifiers.contains(KeyModifiers::ALT) && !altgr;
+        let at = self.cursor;
+        let backspace = key.code == KeyCode::Backspace || (ctrl && key.code == KeyCode::Char('h'));
+        // What's deleted, and where the cursor goes.
+        let (gone, cursor) = match key.code {
+            _ if (backspace && alt) || (ctrl && key.code == KeyCode::Char('w')) => {
+                let start = self.word_before();
+                (start..at, start)
+            }
+            _ if backspace => {
+                let start = match self.text[..at].chars().next_back() {
+                    Some(c) if is_combining_mark(c) => at - c.len_utf8(),
+                    _ => self.letter_before(),
+                };
+                (start..at, start)
+            }
+            KeyCode::Char('u') if ctrl => (0..at, 0),
+            KeyCode::Char('a') if ctrl => (at..at, 0),
+            KeyCode::Char('e') if ctrl => (at..at, self.text.len()),
+            _ if ctrl => return,
+            KeyCode::Delete => (at..self.letter_after(), at),
+            KeyCode::Left | KeyCode::Char('b') if alt => (at..at, self.word_before()),
+            KeyCode::Right | KeyCode::Char('f') if alt => (at..at, self.word_after()),
+            KeyCode::Left => (at..at, self.letter_before()),
+            KeyCode::Right => (at..at, self.letter_after()),
+            KeyCode::Home => (at..at, 0),
+            KeyCode::End => (at..at, self.text.len()),
+            KeyCode::Char(c) if !alt && !text::is_hidden(c) && self.text.chars().count() < max => {
+                self.text.insert(at, c);
+                self.cursor = at + c.len_utf8();
+                return;
+            }
+            _ => return,
+        };
+        self.text.replace_range(gone, "");
+        self.cursor = cursor;
+    }
+
+    /// Where the letter before the cursor starts.
+    fn letter_before(&self) -> usize {
+        let at = self.cursor;
+        self.text[..at]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(at, |(i, _)| i)
+    }
+
+    /// Where the letter after the cursor ends.
+    fn letter_after(&self) -> usize {
+        let at = self.cursor;
+        self.text[at..]
+            .graphemes(true)
+            .next()
+            .map_or(at, |g| at + g.len())
+    }
+
+    /// Where the word before the cursor starts.
+    fn word_before(&self) -> usize {
+        self.text[..self.cursor]
+            .trim_end()
+            .rfind(' ')
+            .map_or(0, |i| i + 1)
+    }
+
+    /// Where the word after the cursor ends.
+    fn word_after(&self) -> usize {
+        let rest = &self.text[self.cursor..];
+        let start = rest.len() - rest.trim_start().len();
+        self.cursor + rest[start..].find(' ').map_or(rest.len(), |i| start + i)
+    }
+
+    /// Puts `pasted` (a line, cleaned) in at the cursor, as much as fits in a
+    /// line of `max` characters, and the cursor after it. `spaced`: whether
+    /// it had a space before it and after it, kept (one) where a word next to
+    /// it would run into it otherwise.
+    pub fn paste(&mut self, pasted: &str, spaced: (bool, bool), max: usize) {
+        if pasted.is_empty() {
+            return;
+        }
+        let (before, after) = self.text.split_at(self.cursor);
+        let word = |c: char| !c.is_whitespace();
+        let lead = if spaced.0 && before.ends_with(word) {
+            " "
+        } else {
+            ""
+        };
+        let trail = if spaced.1 && after.starts_with(word) {
+            " "
+        } else {
+            ""
+        };
+        let line = format!("{lead}{pasted}{trail}");
+        let room = max.saturating_sub(self.text.chars().count());
+        let cut = text::first_chars(&line, room);
+        self.text.insert_str(self.cursor, cut);
+        self.cursor += cut.len();
+    }
 }
 
 /// The tabs of the `?` popup.
@@ -238,7 +387,22 @@ pub struct CategoryMenu {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Naming {
     pub renaming: Option<CategoryId>,
-    pub text: String,
+    pub typed: Typed,
+}
+
+impl Naming {
+    /// The name being typed, `text` so far, the cursor at its end.
+    fn new(renaming: Option<CategoryId>, text: String) -> Self {
+        Self {
+            renaming,
+            typed: Typed::new(text),
+        }
+    }
+
+    /// A new category's name, nothing typed yet.
+    fn blank() -> Self {
+        Self::new(None, String::new())
+    }
 }
 
 /// What the reader shows under an article's title.
@@ -310,8 +474,9 @@ pub struct App {
     read_here: HashSet<ArticleId>,
 
     pub prompt: Option<Prompt>,
-    /// What was typed in the search box when it was left.
-    pub search_typed: Option<String>,
+    /// What was typed in the search box when it was left, and where its
+    /// cursor was.
+    pub search_typed: Option<Typed>,
     pub help: Option<HelpMenu>,
     pub confirm: Option<Confirm>,
     pub category_menu: Option<CategoryMenu>,
@@ -356,34 +521,6 @@ fn toward(key: &KeyEvent) -> Option<Toward> {
         KeyCode::Char('l') | KeyCode::Right => Toward::Right,
         _ => return None,
     })
-}
-
-/// Edits a line being typed with `key`: Backspace, or Ctrl-h, which some
-/// terminals send for it, deletes a character, Ctrl-u the line and Ctrl-w a
-/// word; a character that shows is added while the line holds fewer than
-/// `max`. Whether it was such a key.
-fn edit_line(line: &mut String, key: &KeyEvent, max: usize) -> bool {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    match key.code {
-        KeyCode::Backspace => {
-            line.pop();
-        }
-        KeyCode::Char('h') if ctrl => {
-            line.pop();
-        }
-        KeyCode::Char('u') if ctrl => line.clear(),
-        KeyCode::Char('w') if ctrl => {
-            let trimmed = line.trim_end().len();
-            line.truncate(trimmed);
-            let cut = line.rfind(' ').map_or(0, |i| i + 1);
-            line.truncate(cut);
-        }
-        KeyCode::Char(c) if !ctrl && !text::is_hidden(c) && line.chars().count() < max => {
-            line.push(c);
-        }
-        _ => return false,
-    }
-    true
 }
 
 impl App {
@@ -901,10 +1038,7 @@ impl App {
 
     /// `a`: the box to add a feed in.
     fn open_add_feed(&mut self, text: String) {
-        self.prompt = Some(Prompt {
-            kind: PromptKind::AddFeed,
-            text,
-        });
+        self.prompt = Some(Prompt::new(PromptKind::AddFeed, Typed::new(text)));
     }
 
     /// Looks for the feed at what you typed (a feed's address, or a site's
@@ -1069,10 +1203,7 @@ impl App {
             _ => shown.unwrap_or(0),
         };
         // With none yet, it opens on naming the first.
-        let naming = self.categories.is_empty().then(|| Naming {
-            renaming: None,
-            text: String::new(),
-        });
+        let naming = self.categories.is_empty().then(Naming::blank);
         self.category_menu = Some(CategoryMenu {
             feed,
             selected,
@@ -1110,7 +1241,7 @@ impl App {
                     }
                 }
                 _ => {
-                    edit_line(&mut naming.text, &key, store::MAX_CATEGORY_NAME);
+                    naming.typed.edit(&key, store::MAX_CATEGORY_NAME);
                 }
             }
             return;
@@ -1127,17 +1258,11 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => menu.selected = last,
             KeyCode::Char('n') => {
                 menu.selected = last;
-                menu.naming = Some(Naming {
-                    renaming: None,
-                    text: String::new(),
-                });
+                menu.naming = Some(Naming::blank());
             }
             KeyCode::Enter | KeyCode::Char(' ') => match on {
                 None => {
-                    menu.naming = Some(Naming {
-                        renaming: None,
-                        text: String::new(),
-                    });
+                    menu.naming = Some(Naming::blank());
                 }
                 Some(i) if menu.feed.is_some() => self.toggle_in_category(i),
                 // No feed to put in: Enter opens the category.
@@ -1153,10 +1278,7 @@ impl App {
             KeyCode::Char('r') => {
                 if let Some(i) = on {
                     let category = &self.categories[i];
-                    menu.naming = Some(Naming {
-                        renaming: Some(category.id),
-                        text: category.name.clone(),
-                    });
+                    menu.naming = Some(Naming::new(Some(category.id), category.name.clone()));
                 }
             }
             KeyCode::Char('x' | 'd') | KeyCode::Delete => {
@@ -1208,20 +1330,20 @@ impl App {
         let done = match naming.renaming {
             Some(id) => self
                 .store
-                .rename_category(id, &naming.text)
-                .map(|()| format!("Renamed it {}", naming.text.trim())),
-            None => self.store.add_category(&naming.text).and_then(|id| {
+                .rename_category(id, naming.typed.text())
+                .map(|()| format!("Renamed it {}", naming.typed.text().trim())),
+            None => self.store.add_category(naming.typed.text()).and_then(|id| {
                 if let Some(feed) = feed {
                     self.store.set_in_category(id, feed, true)?;
                 }
-                Ok(format!("Made {}", naming.text.trim()))
+                Ok(format!("Made {}", naming.typed.text().trim()))
             }),
         };
         match done {
             Ok(said) => {
                 self.reload();
                 if let Some(menu) = self.category_menu.as_mut() {
-                    let name = article::one_line(&naming.text, store::MAX_CATEGORY_NAME);
+                    let name = article::one_line(naming.typed.text(), store::MAX_CATEGORY_NAME);
                     if let Some(i) = self.categories.iter().position(|c| c.name == name) {
                         menu.selected = i;
                     }
@@ -1678,19 +1800,23 @@ impl App {
             Event::Key(key) => self.on_key(key),
             Event::Paste(text) => {
                 // Cut before cleaning, so a huge paste costs nothing.
-                let line =
-                    |room: usize| article::one_line(text::first_chars(&text, 2 * MAX_PROMPT), room);
+                let cut = text::first_chars(&text, 2 * MAX_PROMPT);
+                let line = article::one_line(cut, MAX_PROMPT);
+                // In a box, a space it had at either end is kept where a word
+                // next to it would run into it otherwise.
+                let spaced = (
+                    cut.starts_with(char::is_whitespace),
+                    cut.ends_with(char::is_whitespace),
+                );
                 if let Some(prompt) = self.prompt.as_mut() {
-                    let room = MAX_PROMPT.saturating_sub(prompt.text.chars().count());
-                    prompt.text.push_str(&line(room));
+                    prompt.typed.paste(&line, spaced, MAX_PROMPT);
                 } else if let Some(naming) =
                     self.category_menu.as_mut().and_then(|m| m.naming.as_mut())
                 {
-                    let room = store::MAX_CATEGORY_NAME.saturating_sub(naming.text.chars().count());
-                    naming.text.push_str(&line(room));
+                    naming.typed.paste(&line, spaced, store::MAX_CATEGORY_NAME);
                 } else if !self.popup_open() {
                     // A link pasted with no box open: the box to add it.
-                    let pasted = line(MAX_PROMPT);
+                    let pasted = line;
                     if pasted.contains('.') && !pasted.contains(' ') {
                         self.open_add_feed(pasted);
                     } else {
@@ -1786,20 +1912,20 @@ impl App {
             KeyCode::Esc => {
                 let prompt = self.prompt.take().expect("open");
                 if prompt.kind == PromptKind::Search {
-                    self.search_typed = Some(prompt.text);
+                    self.search_typed = Some(prompt.typed);
                 }
             }
             // To the articles, keeping what was typed.
             KeyCode::Char('j') | KeyCode::Down if ctrl => {
                 let prompt = self.prompt.take().expect("open");
                 if prompt.kind == PromptKind::Search {
-                    self.search_typed = Some(prompt.text);
+                    self.search_typed = Some(prompt.typed);
                 }
                 self.focus = Focus::Grid;
             }
             KeyCode::Enter => {
                 let prompt = self.prompt.take().expect("open");
-                let typed = prompt.text.trim().to_string();
+                let typed = prompt.typed.text().trim().to_string();
                 if typed.is_empty() {
                     return;
                 }
@@ -1814,7 +1940,7 @@ impl App {
                 }
             }
             _ => {
-                edit_line(&mut prompt.text, &key, MAX_PROMPT);
+                prompt.typed.edit(&key, MAX_PROMPT);
             }
         }
     }
@@ -1917,17 +2043,13 @@ impl App {
     /// The search box, with what was typed in it when it was left, else
     /// the search shown.
     fn open_search(&mut self) {
-        let text = self
-            .search_typed
-            .take()
-            .unwrap_or_else(|| match &self.view {
+        let typed = self.search_typed.take().unwrap_or_else(|| {
+            Typed::new(match &self.view {
                 View::Search(q) => q.clone(),
                 _ => String::new(),
-            });
-        self.prompt = Some(Prompt {
-            kind: PromptKind::Search,
-            text,
+            })
         });
+        self.prompt = Some(Prompt::new(PromptKind::Search, typed));
     }
 
     /// Opens a sidebar row: its articles, or the search box.
@@ -2445,6 +2567,99 @@ pub mod tests {
     }
 
     #[test]
+    fn the_search_box_edits_where_its_cursor_is() {
+        let mut app = app();
+        press(&mut app, "/ha noi");
+        let text = |app: &App| app.prompt.as_ref().unwrap().typed.text().to_string();
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Left));
+        press(&mut app, "x");
+        assert_eq!(text(&app), "ha nxoi");
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Delete));
+        assert_eq!(text(&app), "ha ni");
+        // A paste goes in at the cursor too.
+        app.on_key(key(KeyCode::Home));
+        app.on_terminal(Event::Paste("tin".into()));
+        press(&mut app, " ");
+        assert_eq!(text(&app), "tin ha ni");
+        app.on_key(key(KeyCode::End));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(text(&app), "tin ha ");
+        // Out to the articles and back: the cursor is where it was.
+        app.on_key(key(KeyCode::Home));
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert!(app.prompt.is_none());
+        press(&mut app, "/x");
+        assert_eq!(text(&app), "xtin ha ");
+        // A paste between words keeps its spaces.
+        app.on_key(key(KeyCode::Home));
+        app.on_key(key(KeyCode::Right));
+        app.on_terminal(Event::Paste(" mới ".into()));
+        assert_eq!(text(&app), "x mới tin ha ");
+        // ← steps over a letter written as two characters (e and its accent),
+        // and Delete takes it whole; Backspace takes the accent first, as an
+        // input method that retypes a letter expects.
+        let mut line = Typed::new("cafe\u{301}!".into());
+        for _ in 0..2 {
+            line.edit(&key(KeyCode::Left), 50);
+        }
+        assert_eq!(&line.text()[..line.at()], "caf");
+        line.edit(&key(KeyCode::Delete), 50);
+        assert_eq!(line.text(), "caf!");
+        let mut line = Typed::new("cafe\u{301}".into());
+        line.edit(&key(KeyCode::Backspace), 50);
+        assert_eq!(line.text(), "cafe");
+        // Option-← (Alt-b, or Alt with ←) goes back a word, Option-Backspace
+        // deletes one; an Alt letter isn't typed, nor does Ctrl-← move.
+        let alt = |code| KeyEvent::new(code, KeyModifiers::ALT);
+        let mut line = Typed::new("tin ha noi".into());
+        line.edit(&alt(KeyCode::Char('b')), 50);
+        assert_eq!(&line.text()[line.at()..], "noi");
+        line.edit(&alt(KeyCode::Left), 50);
+        assert_eq!(&line.text()[line.at()..], "ha noi");
+        line.edit(&alt(KeyCode::Char('f')), 50);
+        assert_eq!(&line.text()[line.at()..], " noi");
+        // An Alt letter isn't typed, nor does Ctrl-← move; AltGr (Ctrl and
+        // Alt) types its letter, Cmd-← and Cmd-→ (Ctrl-a, Ctrl-e) go to
+        // either end, and Cmd-Backspace (Ctrl-u) deletes all before.
+        line.edit(&alt(KeyCode::Char('x')), 50);
+        line.edit(&KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL), 50);
+        assert_eq!(&line.text()[line.at()..], " noi");
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        line.edit(&KeyEvent::new(KeyCode::Char('ą'), altgr), 50);
+        assert_eq!(line.text(), "tin haą noi");
+        line.edit(
+            &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            50,
+        );
+        assert_eq!(line.at(), 0);
+        line.edit(
+            &KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            50,
+        );
+        assert_eq!(line.at(), line.text().len());
+        line.edit(&alt(KeyCode::Char('b')), 50);
+        line.edit(
+            &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            50,
+        );
+        assert_eq!(line.text(), "noi");
+        // Backspace takes a flag whole: it's one letter.
+        let mut flags = Typed::new("🇻🇳🇺🇸".into());
+        flags.edit(&key(KeyCode::Left), 50);
+        flags.edit(&key(KeyCode::Backspace), 50);
+        assert_eq!(flags.text(), "🇺🇸");
+        assert_eq!(flags.at(), 0);
+        let mut line = Typed::new("tin ha noi".into());
+        line.edit(&alt(KeyCode::Char('b')), 50);
+        line.edit(&alt(KeyCode::Left), 50);
+        line.edit(&alt(KeyCode::Char('f')), 50);
+        line.edit(&alt(KeyCode::Backspace), 50);
+        assert_eq!(line.text(), "tin  noi");
+    }
+
+    #[test]
     fn searching_finds_articles_without_their_accents() {
         let mut app = app();
         press(&mut app, "/");
@@ -2479,10 +2694,10 @@ pub mod tests {
         app.on_terminal_events(link);
         assert_eq!(
             app.prompt,
-            Some(Prompt {
-                kind: PromptKind::AddFeed,
-                text: "genk.vn/rss/home.rss".into()
-            })
+            Some(Prompt::new(
+                PromptKind::AddFeed,
+                Typed::new("genk.vn/rss/home.rss".into())
+            ))
         );
     }
 
@@ -2502,7 +2717,11 @@ pub mod tests {
         let url = "https://vnexpress.net/rss/oto-xe-may.rss";
         assert!(app.listed().all(|f| f.url != url));
         app.add_feed(url);
-        assert!(app.listed().any(|f| f.url == url));
+        assert_eq!(
+            app.listed().last().map(|f| f.url.as_str()),
+            Some(url),
+            "last"
+        );
         assert!(app.status.as_ref().is_some_and(|s| !s.error));
     }
 

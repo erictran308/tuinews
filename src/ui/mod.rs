@@ -23,7 +23,7 @@ use ratatui::widgets::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Confirm, Focus, HelpMenu, HelpTab, Kept, PromptKind, View};
+use crate::app::{App, Confirm, Focus, HelpMenu, HelpTab, Kept, Naming, PromptKind, Typed, View};
 use crate::settings::Settings;
 use crate::theme::{self, Colors};
 use effects::Popup;
@@ -278,24 +278,18 @@ fn hints_fitting(hints: &str, width: usize, c: &Colors) -> Vec<Span<'static>> {
 /// everywhere, a character as the terminal draws it (a grapheme, as ratatui
 /// does): ⚔️ is two columns, though ⚔ alone is one. None is ever cut in two.
 pub fn fit(text: &str, width: usize) -> String {
-    if text.width() <= width {
+    if cells(text) <= width {
         return text.to_string();
     }
     if width == 0 {
         return String::new();
     }
-    let mut out = String::new();
-    let mut used = 0;
-    for grapheme in text.graphemes(true) {
-        let w = grapheme.width();
-        if used + w > width - 1 {
-            break;
-        }
-        used += w;
-        out.push_str(grapheme);
-    }
-    out.push('…');
-    out
+    format!("{}…", head(text, width - 1))
+}
+
+/// The columns `text` takes, a grapheme at a time, as [`fit`] measures.
+fn cells(text: &str) -> usize {
+    text.graphemes(true).map(UnicodeWidthStr::width).sum()
 }
 
 /// The end of `text` that fits in `width` columns, found in one pass from
@@ -312,6 +306,38 @@ fn tail(text: &str, width: usize) -> &str {
         start = i;
     }
     &text[start..]
+}
+
+/// The start of `text` that fits in `width` columns.
+fn head(text: &str, width: usize) -> &str {
+    let mut used = 0;
+    for (i, grapheme) in text.grapheme_indices(true) {
+        used += grapheme.width();
+        if used > width {
+            return &text[..i];
+        }
+    }
+    text
+}
+
+/// What's typed in a box, in `room` columns and one more, the cursor a
+/// block on the letter it's before (on a space at the end). The cursor
+/// stays in view, with what's after it as far as there's room (half of it,
+/// when what's before needs more).
+fn with_cursor(typed: &Typed, room: usize, c: &Colors) -> Vec<Span<'static>> {
+    let (before, after) = typed.text().split_at(typed.at());
+    let (under, after) = match after.graphemes(true).next() {
+        Some(letter) => (letter, &after[letter.len()..]),
+        None => (" ", ""),
+    };
+    let room = (room + 1).saturating_sub(cells(under));
+    let before = tail(before, room.saturating_sub(cells(after).min(room / 2)));
+    let after = head(after, room.saturating_sub(cells(before)));
+    vec![
+        Span::styled(before.to_string(), Style::new().fg(c.text)),
+        Span::styled(under.to_string(), Style::new().fg(c.panel).bg(c.accent)),
+        Span::styled(after.to_string(), Style::new().fg(c.text)),
+    ]
 }
 
 /// `text` in rows at most `width` columns wide, broken between words (a
@@ -390,19 +416,22 @@ pub(super) fn search_box(app: &App, width: u16, right: u16, line: Style) -> Line
                 PromptKind::Search => (app.icons.search, ""),
                 PromptKind::AddFeed => (app.icons.link, "Add a feed: "),
             };
-            // The end of what's typed stays in view.
+            // The cursor stays in view.
             let room = inner.saturating_sub(label.width() + 1);
-            let shown = tail(&prompt.text, room).to_string();
-            vec![
+            let mut spans = vec![
                 Span::styled(format!(" {icon} "), Style::new().fg(c.accent)),
                 Span::styled(label, Style::new().fg(c.dim)),
-                Span::styled(shown, Style::new().fg(c.text)),
-                Span::styled("▏", Style::new().fg(c.accent)),
-            ]
+            ];
+            spans.extend(with_cursor(&prompt.typed, room, c));
+            spans
         }
         // What was left typed in it, else what it's for.
         None => {
-            let typed = app.search_typed.as_deref().filter(|t| !t.is_empty());
+            let typed = app
+                .search_typed
+                .as_ref()
+                .map(Typed::text)
+                .filter(|t| !t.is_empty());
             let room = inner.saturating_sub(4);
             let shown = typed.map_or_else(
                 || fit("Search your articles", room),
@@ -415,12 +444,16 @@ pub(super) fn search_box(app: &App, width: u16, right: u16, line: Style) -> Line
         }
     };
     let hint = app.prompt.is_none() && box_width > MIN_SEARCH;
-    let used: usize = spans.iter().map(Span::width).sum();
+    let used: usize = spans.iter().map(|s| cells(&s.content)).sum();
     let pad = box_width.saturating_sub(used + if hint { 3 } else { 0 });
     spans.push(Span::raw(" ".repeat(pad)));
+    // The box's colour, under all but the cursor's own.
     let mut spans: Vec<Span> = spans
         .into_iter()
-        .map(|s| s.patch_style(Style::new().bg(bg)))
+        .map(|s| match s.style.bg {
+            Some(_) => s,
+            None => s.patch_style(Style::new().bg(bg)),
+        })
         .collect();
     if hint {
         spans.push(Span::styled(" / ", Style::new().fg(c.dim).bg(c.selected)));
@@ -446,10 +479,10 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
         (_, Some(prompt)) => {
             let keys = match prompt.kind {
                 PromptKind::Search => {
-                    " `Enter` search · `Ctrl-j` articles · `Esc` cancel · `Ctrl-u` clear · without accents finds them too"
+                    " `Enter` search · `Ctrl-j` articles · `Esc` cancel · `Ctrl-u` clear · without accents finds them too · `←→` move"
                 }
                 PromptKind::AddFeed => {
-                    " Type or paste a feed's address, or a site's · `Enter` add · `Esc` cancel · `Ctrl-u` clear"
+                    " Type or paste a feed's address, or a site's · `Enter` add · `Esc` cancel · `Ctrl-u` clear · `←→` move"
                 }
             };
             hints_fitting(keys, room, c)
@@ -491,7 +524,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-const HELP: [(&str, &str); 27] = [
+const HELP: [(&str, &str); 33] = [
     ("←↓↑→  h j k l", "move, in the pane that has the keys"),
     (
         "Ctrl + ←↓↑→  h j k l",
@@ -532,6 +565,12 @@ const HELP: [(&str, &str); 27] = [
     ("o  Enter", "open it in your browser"),
     ("w  m  y", "save, unread, copy its link"),
     ("Esc  q  Backspace", "back to the articles"),
+    ("", ""),
+    ("In a box you type in", ""),
+    ("←→  Option ←→", "move a letter, a word"),
+    ("Home End  Cmd ←→", "to either end"),
+    ("Backspace  Delete", "delete the letter before, after"),
+    ("Ctrl-w  Ctrl-u", "delete the word before, all before"),
     ("", ""),
     (
         "?  /  O  /  q",
@@ -855,15 +894,7 @@ fn category_menu(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     lines.push(Line::default());
     let first_row = lines.len();
-    let field = |text: &str| {
-        vec![
-            Span::styled(
-                tail(text, CATEGORY_WIDTH).to_string(),
-                Style::new().fg(c.text),
-            ),
-            Span::styled("▏", Style::new().fg(c.accent)),
-        ]
-    };
+    let field = |naming: &Naming| with_cursor(&naming.typed, CATEGORY_WIDTH, &c);
     let selected = menu.selected.min(app.categories.len());
     // The counts in a column after the longest name.
     let names = app
@@ -901,7 +932,7 @@ fn category_menu(frame: &mut Frame, app: &mut App, area: Rect) {
             .as_ref()
             .filter(|n| n.renaming == Some(category.id));
         match renaming {
-            Some(naming) => spans.extend(field(&naming.text)),
+            Some(naming) => spans.extend(field(naming)),
             None => {
                 let n = category.feeds.len();
                 let name = fit(&category.name, CATEGORY_WIDTH - 12);
@@ -920,13 +951,13 @@ fn category_menu(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let mut new = vec![Span::styled(" +   ", Style::new().fg(c.accent))];
     match menu.naming.as_ref().filter(|n| n.renaming.is_none()) {
-        Some(naming) => new.extend(field(&naming.text)),
+        Some(naming) => new.extend(field(naming)),
         None => new.push(Span::styled("New category", Style::new().fg(c.subtext))),
     }
     row(&mut lines, app.categories.len(), new);
 
     let hint = match (&menu.naming, &menu.feed) {
-        (Some(_), _) => " `Enter` save · `Esc` cancel ",
+        (Some(_), _) => " `Enter` save · `Esc` cancel · `←→` move ",
         (None, Some(_)) => " `Enter` in or out · `n` new · `r` rename · `x` delete · `Esc` close ",
         (None, None) => " `Enter` open · `n` new · `r` rename · `x` delete · `Esc` close ",
     };
@@ -1076,5 +1107,42 @@ mod tests {
         assert!(rows[1].ends_with('…'), "{rows:?}");
         assert!(rows.iter().all(|r| r.width() <= 10));
         assert_eq!(wrap_lines("ngắn", 10, 3), ["ngắn"]);
+    }
+
+    #[test]
+    fn the_search_box_keeps_its_cursor_in_view() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('/')));
+        let cursor_on = |app: &App| {
+            let line = search_box(app, 140, 0, Style::new());
+            let block = line
+                .spans
+                .iter()
+                .find(|s| s.style.bg == Some(app.colors.accent));
+            block.map(|s| s.content.to_string())
+        };
+        let typed = &mut app.prompt.as_mut().unwrap().typed;
+        *typed = Typed::new("hà nội mưa lớn".into());
+        typed.edit(&key(KeyCode::Home), 100);
+        for _ in 0..3 {
+            typed.edit(&key(KeyCode::Right), 100);
+        }
+        let shown = screen(&mut app, 140, 40);
+        assert!(shown.contains("hà nội mưa lớn"), "{shown}");
+        assert_eq!(cursor_on(&app).as_deref(), Some("n"), "a block on the n");
+        // At the end, a block after the last letter.
+        app.prompt
+            .as_mut()
+            .unwrap()
+            .typed
+            .edit(&key(KeyCode::End), 100);
+        assert_eq!(cursor_on(&app).as_deref(), Some(" "));
+        // Longer than the box, the cursor at its start: it's in view.
+        let typed = &mut app.prompt.as_mut().unwrap().typed;
+        *typed = Typed::new("tin ".repeat(40));
+        typed.edit(&key(KeyCode::Home), 100);
+        let shown = screen(&mut app, 140, 40);
+        assert!(shown.contains("tin tin"), "{shown}");
+        assert_eq!(cursor_on(&app).as_deref(), Some("t"));
     }
 }
