@@ -20,6 +20,8 @@ cargo clippy --all-targets       # keep it warning-free
 cargo fmt
 ```
 
+Releasing: the version in `Cargo.toml`, CI green on `main`, `cargo publish --locked` (with `CARGO_TARGET_DIR` set elsewhere: a `target/package` build leaves later ones stale), then a tag `vX.Y.Z` pushed. The tag starts `.github/workflows/release.yml`: it builds tuinews for macOS (ARM, Intel), Linux (musl, x86_64 and ARM) and Windows, with jobs that can't write, then one that can makes the GitHub release if there's none and puts the archives and `SHA256SUMS` on it. Run it by hand (Actions → Release, a tag) to build for a tag again.
+
 ## Security
 
 Everything from a feed or a page is untrusted: titles, summaries, links, picture URLs, dates, HTML, image bytes.

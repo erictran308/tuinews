@@ -38,7 +38,16 @@ Arrow keys or vim keys. No account, no tracking, nothing but the feeds you read.
 
 ## Get started
 
-**1. Install it.** You need Rust 1.90 or newer ([rustup.rs](https://rustup.rs)) and a C compiler, for the SQLite and TLS code built into tuinews: `xcode-select --install` on macOS, `build-essential` (or your system's `gcc`) on Linux, the Visual Studio Build Tools that rustup offers on Windows. Then:
+**1. Install it.** Download it ready-made from the [latest release](https://github.com/erictran308/tuinews/releases/latest): `aarch64-apple-darwin` for a Mac with Apple silicon, `x86_64-apple-darwin` for an Intel one, `x86_64-unknown-linux-musl` for any Linux (`aarch64-unknown-linux-musl` on ARM), `x86_64-pc-windows-msvc` for Windows. `SHA256SUMS` beside them says what each should hash to. Unpack it and put `tuinews` in a folder on your `PATH`:
+
+```sh
+tar xzf tuinews-*-aarch64-apple-darwin.tar.gz
+mv tuinews-*-aarch64-apple-darwin/tuinews ~/.local/bin/
+```
+
+On Windows, unzip it and put `tuinews.exe` in a folder on your `PATH`. If macOS won't open it because it can't check it (tuinews isn't signed by Apple), let it: `xattr -d com.apple.quarantine ~/.local/bin/tuinews`.
+
+Or build it with Cargo. You need Rust 1.90 or newer ([rustup.rs](https://rustup.rs)) and a C compiler, for the SQLite and TLS code built into tuinews: `xcode-select --install` on macOS, `build-essential` (or your system's `gcc`) on Linux, the Visual Studio Build Tools that rustup offers on Windows. Then:
 
 ```sh
 cargo install tuinews --locked
