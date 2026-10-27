@@ -9,6 +9,8 @@ mod html;
 mod icons;
 mod images;
 mod opml;
+mod pepper;
+mod player;
 mod proxy;
 mod screen;
 mod settings;
@@ -118,6 +120,10 @@ async fn run() -> Result<()> {
     let picker = images::picker(settings.image_mode());
     let images = images::Images::new(picker, tx.clone(), http.clone(), Some(image_cache));
     let mut app = app::App::new(store, settings, Some(settings_path), http, tx, images);
+    // Videos play in mpv's window, or inside Pepper through pepper-play.
+    app.tools = tools::Tools::find();
+    app.pepper = pepper::port();
+    app.pepper_holes = pepper::takes_holes();
     if !unknown_settings.is_empty() {
         app.error(format!(
             "settings.toml: tuinews doesn't know {}, so it's ignored",
@@ -155,6 +161,35 @@ async fn print_check(config: &config::Config, settings: &settings::Settings) -> 
     let store = store::Store::open(&config.data_dir.join("tuinews.db"))?;
     let feeds = store.feeds()?;
     let failing = feeds.iter().filter(|f| f.error.is_some()).count();
+    let found = tools::Tools::find();
+    let shown = |path: &Option<PathBuf>| path.as_deref().map(config::shown);
+    let mpv = shown(&found.mpv).unwrap_or_else(|| {
+        format!(
+            "not found: videos don't play ({})",
+            tools::Tools::mpv_hint()
+        )
+    });
+    let video = match (pepper::port(), shown(&found.pepper_play)) {
+        _ if proxy::get().is_some() => {
+            "don't play: a proxy is set, and mpv could be led around it".into()
+        }
+        (Some(_), Some(play)) if settings.inline_video => {
+            let holes = if pepper::takes_holes() {
+                "a popup over one shows, as it plays on"
+            } else {
+                "an older Pepper: one is hidden while a popup is open"
+            };
+            format!("inside Pepper, through {play} ({holes})")
+        }
+        // The inside case is above: here it'd be mpv's window, with none.
+        _ if found.mpv.is_none() => "don't play: mpv isn't installed".into(),
+        (Some(_), Some(_)) => "in mpv's window (inline_video is off)".into(),
+        (Some(_), None) => "in mpv's window: Pepper's pepper-play wasn't found".into(),
+        (None, _) if std::env::var_os("PEPPER_PORT").is_some() => {
+            "in mpv's window: Pepper, but through a multiplexer (tmux, screen, zellij)".into()
+        }
+        (None, _) => "in mpv's window (inside the terminal in Pepper)".into(),
+    };
     print(&format!(
         "tuinews {version}
 data folder  {data}
@@ -162,6 +197,8 @@ feeds        {count} ({failing} failed the last time they were fetched)
 proxy        {proxy}
 terminal     TERM={term} TERM_PROGRAM={program} {tmux}
 images       {images}
+mpv          {mpv}
+videos       {video}
 ",
         version = env!("CARGO_PKG_VERSION"),
         data = config::shown(&config.data_dir),
@@ -233,6 +270,10 @@ Environment:
                          or blocks (also `images` in settings.toml)
   TN_ICONS               which icons: auto, nerd (Nerd Font) or plain
                          (also `icons` in settings.toml)
+  TN_MPV                 the mpv that plays an article's videos, if not
+                         the one on PATH
+  TN_PEPPER_PLAY         in Pepper, its pepper-play, if not where Pepper
+                         says (PEPPER_PLAY)
   https_proxy, ...       one http:// or https:// proxy for everything: the
                          first set of https_proxy, HTTPS_PROXY, all_proxy,
                          ALL_PROXY, http_proxy, HTTP_PROXY

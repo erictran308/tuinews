@@ -44,10 +44,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.images.hold(false);
     }
     app.images.new_frame();
+    app.video_box.set(None);
     let area = frame.area();
     let c = app.colors.clone();
     frame.render_widget(Block::new().style(Style::new().bg(c.bg).fg(c.text)), area);
     let [body, status] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    if app.fills_tab() {
+        return full_screen(frame, app, body, status, now);
+    }
     // The search box is in the articles' border, so they show while it's
     // open; the reader opens over them.
     let narrow = body.width < NARROW;
@@ -91,6 +95,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.welcome {
         welcome(frame, app, area);
     }
+    note_drawn_over(app);
     if let Some(splash) = &app.splash {
         // Over all of it: what the frame drew has asked for its pictures.
         app.effects.popups.get_mut().clear();
@@ -101,6 +106,67 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         effects::over(app, frame.buffer_mut(), Some(status));
     }
     pin_emoji_widths(frame.buffer_mut());
+}
+
+/// The video playing inside Pepper over the whole tab (`f`), black under
+/// it, and the player's line in the status bar; the popups over it, which
+/// open out as anywhere (`effects::under` moves the animations' time on).
+fn full_screen(frame: &mut Frame, app: &mut App, body: Rect, status: Rect, now: Instant) {
+    frame.render_widget(Block::new().style(Style::new().bg(theme::BLACK)), body);
+    if let Some(playing) = app.playing.as_ref().filter(|p| !p.started) {
+        let middle = Rect {
+            y: body.y + body.height / 2,
+            height: 1,
+            ..body
+        };
+        let waiting = if playing.failed {
+            "Can't play it".to_string()
+        } else {
+            format!("{} Loading the video…", app.icons.loading)
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(waiting, Style::new().fg(theme::WHITE))).centered(),
+            middle,
+        );
+    }
+    app.video_box.set(Some(body));
+    status_bar(frame, app, status);
+    effects::under(app, frame.buffer_mut(), now);
+    if app.help.is_some() {
+        help(frame, app, frame.area());
+    }
+    note_drawn_over(app);
+    effects::over(app, frame.buffer_mut(), Some(status));
+    pin_emoji_widths(frame.buffer_mut());
+}
+
+/// Notes the popups the frame drew, as holes in the video's box.
+fn note_drawn_over(app: &mut App) {
+    app.drawn_over = app
+        .effects
+        .popups
+        .borrow()
+        .iter()
+        .filter(|(popup, _)| *popup != Popup::Reader)
+        .map(|&(_, place)| place)
+        .collect();
+}
+
+/// Where the video playing is, as the status bar and the line under it say
+/// it: `0:12 / 1:21`, or how far it played while its length isn't known.
+pub fn played(playing: &crate::app::Playing) -> String {
+    let time = |seconds: f64| {
+        let s = seconds.max(0.0) as u64;
+        if s >= 3600 {
+            format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+        } else {
+            format!("{}:{:02}", s / 60, s % 60)
+        }
+    };
+    match playing.duration.filter(|d| d.is_finite() && *d > 0.0) {
+        Some(length) => format!("{} / {}", time(playing.position), time(length)),
+        None => time(playing.position),
+    }
 }
 
 /// Where the reader opens: over the articles, in the middle, as wide as
@@ -536,6 +602,34 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     );
     let room = width.saturating_sub(right.width());
     let left = match (&app.status, &app.prompt) {
+        // Over the full screen, where the video plays, always; a message
+        // in the keys' place.
+        (_, None) if app.fills_tab() => {
+            let playing = app.playing.as_ref().expect("fills the tab");
+            let mark = if playing.paused {
+                app.icons.pause
+            } else {
+                app.icons.play
+            };
+            let mut spans = vec![Span::styled(
+                format!(" {mark} {} ", played(playing)),
+                Style::new().fg(c.accent).add_modifier(Modifier::BOLD),
+            )];
+            let used: usize = spans.iter().map(Span::width).sum();
+            let rest = room.saturating_sub(used);
+            match &app.status {
+                Some(status) => spans.push(Span::styled(
+                    fit(&format!("· {}", status.text), rest),
+                    Style::new().fg(if status.error { c.red } else { c.ok }),
+                )),
+                None => spans.extend(hints_fitting(
+                    "· `Space` pause · `←→` 5 s · `↓↑` a minute · `f` `Esc` back · `x` stop · `?` help",
+                    rest,
+                    c,
+                )),
+            }
+            spans
+        }
         (_, Some(prompt)) => {
             let keys = match prompt.kind {
                 PromptKind::Search => {
@@ -554,11 +648,19 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(color),
             )]
         }
-        (None, None) if app.reader.is_some() => hints_fitting(
-            " `Esc` back · `j k` scroll · `Space` page · `]` `[` next, before · `o` browser · `w` save · `m` unread · `y` copy link · `?` help",
-            room,
-            c,
-        ),
+        (None, None) if app.reader.is_some() => {
+            let video = app.playing.is_some()
+                || app.reader.as_ref().is_some_and(|r| {
+                    matches!(&r.body, crate::app::Body::Text(blocks)
+                        if blocks.iter().any(|b| matches!(b, crate::html::Block::Video(_))))
+                });
+            let keys = if video {
+                " `Esc` back · `Enter` play or pause · `f` full screen · `x` stop · `j k` scroll · `Space` page · `]` `[` next, before · `o` browser · `w` save · `m` unread · `y` copy link · `?` help"
+            } else {
+                " `Esc` back · `j k` scroll · `Space` page · `]` `[` next, before · `o` browser · `w` save · `m` unread · `y` copy link · `?` help"
+            };
+            hints_fitting(keys, room, c)
+        }
         (None, None) => {
             let keys = match app.focus {
                 Focus::Grid if app.view.keeps_all() => {
@@ -584,7 +686,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-const HELP: [(&str, &str); 33] = [
+const HELP: [(&str, &str); 36] = [
     ("←↓↑→  h j k l", "move, in the pane that has the keys"),
     (
         "Ctrl + ←↓↑→  h j k l",
@@ -625,6 +727,18 @@ const HELP: [(&str, &str); 33] = [
     ("o  Enter", "open it in your browser"),
     ("w  m  y", "save, unread, copy its link"),
     ("Esc  q  Backspace", "back to the articles"),
+    (
+        "Enter  f  x",
+        "a video shown: play it or pause it, full screen, stop it",
+    ),
+    (
+        "",
+        "(inside Pepper it plays in the article; elsewhere in mpv's window)",
+    ),
+    (
+        "Space  ←→  ↓↑",
+        "full screen in Pepper: pause, 5 s, a minute (f or Esc goes back)",
+    ),
     ("", ""),
     ("In a box you type in", ""),
     ("←→  Alt or Option ←→", "move a letter, a word"),
@@ -801,6 +915,12 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         HelpMenu::FULL_TEXT,
         check(settings.full_text),
         "Read the whole article here, from its page (else its summary)",
+    );
+    add(
+        &mut lines,
+        HelpMenu::INLINE_VIDEO,
+        check(settings.inline_video),
+        "Play videos inside Pepper, in the article (else in mpv's window)",
     );
     // Not a row: blocked words are written in settings.toml.
     let blocked = match settings.blocked() {
@@ -1153,6 +1273,128 @@ mod tests {
         // paragraph and its caption.
         assert!(at("Chú thích ảnh") > at("Đoạn đầu.") + 4, "{shown}");
         assert!(shown.contains(app.icons.picture), "its mark while it loads");
+    }
+
+    #[test]
+    fn a_video_shows_as_its_poster_with_what_enter_does() {
+        let mut app = app();
+        let video = crate::app::tests::reading_a_video(&mut app);
+        app.reader.as_mut().unwrap().videos_shown.clear();
+        let shown = screen(&mut app, 150, 60);
+        assert!(shown.contains("Video · Enter plays it"), "{shown}");
+        assert!(shown.contains(app.icons.play), "its mark on the shade");
+        assert!(shown.contains("Enter play or pause"), "the keys: {shown}");
+        assert_eq!(
+            app.reader.as_ref().unwrap().videos_shown,
+            [video],
+            "noted for Enter"
+        );
+        assert_eq!(app.video_box.get(), None, "nothing plays");
+    }
+
+    #[test]
+    fn inside_pepper_the_video_plays_in_its_place_the_corner_or_the_tab() {
+        let mut app = app();
+        let video = crate::app::tests::reading_a_video(&mut app);
+        let reader = app.reader.as_mut().unwrap();
+        if let crate::app::Body::Text(blocks) = &mut reader.body {
+            blocks.extend((0..60).map(|n| crate::html::Block::Paragraph(format!("Đoạn {n}."))));
+        }
+        crate::app::tests::play(&mut app, &video, true);
+        let shown = screen(&mut app, 150, 50);
+        assert!(shown.contains("Enter pauses · f fills the tab"), "{shown}");
+        let place = app.video_box.get().expect("in its place");
+        let line = shown
+            .lines()
+            .position(|l| l.contains("Enter pauses"))
+            .unwrap();
+        assert_eq!(usize::from(place.bottom()), line, "the line right under it");
+        // Scrolled away: in the reader's bottom right corner.
+        app.on_key(key(KeyCode::Char('G')));
+        screen(&mut app, 150, 50);
+        let corner = app.video_box.get().expect("in the corner");
+        assert_ne!(corner, place);
+        assert!(corner.bottom() > 40 && corner.right() > 100, "{corner:?}");
+        // f: the whole tab but the status bar, with where it plays there.
+        let playing = app.playing.as_mut().unwrap();
+        (playing.position, playing.duration) = (12.0, Some(81.0));
+        app.on_key(key(KeyCode::Char('f')));
+        let shown = screen(&mut app, 150, 50);
+        assert_eq!(app.video_box.get(), Some(Rect::new(0, 0, 150, 49)));
+        let status = shown.lines().last().unwrap();
+        assert!(status.contains("0:12 / 1:21"), "{status}");
+        assert!(status.contains("f Esc back"), "{status}");
+        // A message shows in the keys' place, the time still there.
+        app.info("Pasted text goes in a box");
+        let shown = screen(&mut app, 150, 50);
+        let status = shown.lines().last().unwrap();
+        assert!(status.contains("0:12 / 1:21 · Pasted text"), "{status}");
+        app.status = None;
+        // A popup over it: what Pepper leaves the cells to.
+        app.on_key(key(KeyCode::Char('?')));
+        screen(&mut app, 150, 50);
+        assert_eq!(app.drawn_over.len(), 1, "the help: {:?}", app.drawn_over);
+        assert_eq!(app.video_box.get(), Some(Rect::new(0, 0, 150, 49)));
+        // An older Pepper takes the picture away under a popup: no black
+        // box in the corner hides the text then.
+        app.help = None;
+        app.on_key(key(KeyCode::Char('f')));
+        app.help = Some(HelpMenu::new(HelpTab::Keys));
+        screen(&mut app, 150, 50);
+        assert_eq!(app.video_box.get(), None);
+    }
+
+    #[test]
+    fn a_video_in_a_window_too_narrow_or_short_for_it_breaks_nothing() {
+        let mut app = app();
+        crate::app::tests::reading_a_video(&mut app);
+        for (w, h) in [(8, 20), (9, 12), (5, 30), (20, 6)] {
+            screen(&mut app, w, h);
+        }
+        // Scrolled in a window so short the folded head takes it all.
+        for _ in 0..6 {
+            app.on_key(key(KeyCode::Char('j')));
+        }
+        for h in [6, 7, 8] {
+            screen(&mut app, 60, h);
+        }
+        // What Enter plays is what the last frame showed: here, none.
+        screen(&mut app, 150, 60);
+        app.reader.as_mut().unwrap().scroll = 0;
+        screen(&mut app, 150, 60);
+        assert!(!app.reader.as_ref().unwrap().videos_shown.is_empty());
+        screen(&mut app, 12, 4);
+        assert!(app.reader.as_ref().unwrap().videos_shown.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_popup_over_the_full_screen_opens_out_and_shows() {
+        let mut app = app();
+        app.effects.live = true;
+        let video = crate::app::tests::reading_a_video(&mut app);
+        crate::app::tests::play(&mut app, &video, true);
+        screen(&mut app, 150, 50);
+        app.on_key(key(KeyCode::Char('f')));
+        app.on_key(key(KeyCode::Char('?')));
+        screen(&mut app, 150, 50);
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        let mut terminal = Terminal::new(TestBackend::new(150, 50)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let line = (0..50)
+            .find(|&y| {
+                let row: String = (0..150).map(|x| buffer[(x, y)].symbol()).collect();
+                row.contains("read the article here")
+            })
+            .expect("the help's keys");
+        let x = (0..150)
+            .find(|&x| buffer[(x, line)].symbol() == "r")
+            .unwrap();
+        assert_ne!(
+            buffer[(x, line)].fg,
+            app.colors.panel,
+            "opened out, its words showing"
+        );
     }
 
     #[test]

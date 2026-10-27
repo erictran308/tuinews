@@ -11,10 +11,12 @@ use serde::Deserialize;
 /// The theme used when the settings name none, or one that isn't built in.
 pub const DEFAULT: &str = "mocha";
 
-/// White as an exact color rather than the terminal's named one, whose shade
-/// its own palette picks (the animations, `ui::effects`, blend from what a
-/// cell shows): on the logo.
+/// Colors drawn that aren't the theme's, as exact colors rather
+/// than the terminal's named ones, whose shade its own palette picks (the
+/// animations, `ui::effects`, blend from what a cell shows): white on the
+/// logo, and black behind a video playing inside Pepper.
 pub const WHITE: Color = Color::Rgb(255, 255, 255);
+pub const BLACK: Color = Color::Rgb(0, 0, 0);
 
 /// The logo's orange, the feed icon's own, the same on every theme: white
 /// shows on it, where a theme's own orange is too pale for that.

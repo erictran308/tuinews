@@ -64,6 +64,8 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # HTML: feeds' summaries, and an article's text from its page.
 scraper = { version = "0.29", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
+# JSON: the player's control socket, and the videos a page's data names.
+serde_json = "1.0.154"
 # The animations (ui/effects.rs), on ratatui's own core, without its DSL.
 tachyonfx = { version = "0.25.2", default-features = false, features = ["std", "std-duration"] }
 tokio = { version = "1.53.1", features = ["full"] }

@@ -36,6 +36,10 @@ pub struct Settings {
     /// browser's reader view does: one request to the site, as opening it
     /// in the browser would be. Off: the reader shows the feed's summary.
     pub full_text: bool,
+    /// In Pepper (a terminal that shows video inside it), play an article's
+    /// video in its box in the reader, through Pepper's pepper-play; off,
+    /// or anywhere else, in mpv's window.
+    pub inline_video: bool,
     /// Remember the articles you open here, in History. Kept only on this
     /// computer.
     pub history: bool,
@@ -71,6 +75,7 @@ impl Default for Settings {
             list: false,
             unread_only: false,
             full_text: true,
+            inline_video: true,
             history: true,
             refresh_minutes: 15,
             keep_days: 30,
@@ -85,13 +90,14 @@ impl Default for Settings {
 }
 
 /// The settings tuinews reads.
-const KNOWN: [&str; 15] = [
+const KNOWN: [&str; 16] = [
     "theme",
     "animations",
     "summaries",
     "list",
     "unread_only",
     "full_text",
+    "inline_video",
     "history",
     "refresh_minutes",
     "keep_days",

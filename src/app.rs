@@ -7,6 +7,7 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,18 +16,22 @@ use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
+use ratatui::layout::Rect;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::article::{self, Article, ArticleId, FeedId};
 use crate::feed::{self, Fetched};
-use crate::html::{self, Block};
+use crate::html::{self, Block, Video};
 use crate::icons::Icons;
 use crate::images::{ImageEvent, Images};
+use crate::pepper;
+use crate::player::{self, Player, PlayerEvent, PlayerEventKind};
 use crate::settings::Settings;
 use crate::store::{self, CategoryId, CategoryRow, FeedRow, Listing, Store};
 use crate::text;
 use crate::theme::{self, Colors};
+use crate::tools::Tools;
 use crate::typed::{self, Typed};
 use crate::ui::effects::Effects;
 use crate::ui::plural;
@@ -87,6 +92,8 @@ pub enum AppEvent {
         path: PathBuf,
         result: Result<opml::Opml>,
     },
+    /// What the player of an article's video said.
+    Player(PlayerEvent),
     /// SIGHUP or SIGTERM: quit as `q` does. Unix's only: nothing sends it
     /// on Windows.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -207,9 +214,10 @@ impl HelpMenu {
     pub const LIST: usize = 1;
     pub const UNREAD_ONLY: usize = 2;
     pub const FULL_TEXT: usize = 3;
-    pub const HISTORY: usize = 4;
-    pub const ANIMATIONS: usize = 5;
-    pub const THEMES: usize = 6;
+    pub const INLINE_VIDEO: usize = 4;
+    pub const HISTORY: usize = 5;
+    pub const ANIMATIONS: usize = 6;
+    pub const THEMES: usize = 7;
     pub const LAST: usize = Self::THEMES + theme::BUILT_IN.len() - 1;
 
     pub fn new(tab: HelpTab) -> Self {
@@ -299,6 +307,39 @@ pub struct Reader {
     /// As far as it scrolls, and a page's rows, as the last frame drew it.
     pub max_scroll: Cell<usize>,
     pub page: Cell<usize>,
+    /// The videos the last frame showed, those shown whole first: what
+    /// Enter plays.
+    pub videos_shown: Vec<Video>,
+}
+
+/// An article's video playing: in mpv's window, or inside Pepper in its
+/// box in the reader (or the whole tab, `fullscreen`).
+pub struct Playing {
+    pub player: Player,
+    pub video: Video,
+    /// The token its box is placed with, inside Pepper; none for mpv's
+    /// window.
+    pub pepper: Option<String>,
+    pub position: f64,
+    pub duration: Option<f64>,
+    pub paused: bool,
+    /// The player said its first frame is there (`Restarted`): until then
+    /// Pepper's box is empty, and the poster shows where it is.
+    pub started: bool,
+    /// The player couldn't open it (`Failed`).
+    pub failed: bool,
+    /// It played to its end (`Ended`): before its first frame, an empty
+    /// stream.
+    pub ended: bool,
+    /// Inside Pepper, it fills the tab (`f`).
+    pub fullscreen: bool,
+}
+
+impl Playing {
+    /// Whether it plays inside the terminal, not in mpv's window.
+    pub fn inside(&self) -> bool {
+        self.pepper.is_some()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -376,6 +417,28 @@ pub struct App {
     /// The system clipboard, kept for the whole run: on Linux, copied text
     /// lasts only while it's held.
     clipboard: Option<arboard::Clipboard>,
+
+    /// The players found at start (`main`: `Tools::find`); none in tests.
+    pub tools: Tools,
+    /// Pepper's port, when tuinews runs in Pepper (`pepper::port`, set by
+    /// `main`): videos play inside the terminal there.
+    pub pepper: Option<OsString>,
+    /// This Pepper takes holes in a video's box (`pepper::takes_holes`), so
+    /// a popup over it shows while it plays on around it.
+    pub pepper_holes: bool,
+    /// The video playing, if one is.
+    pub playing: Option<Playing>,
+    /// Playbacks started: each one's number, so what one that's gone still
+    /// says isn't taken for the next one's.
+    plays: u64,
+    /// Where the video playing inside Pepper is drawn this frame: its box in
+    /// the text, the corner box, or the tab (`ui::draw` lays it out).
+    pub video_box: Cell<Option<Rect>>,
+    /// The popups the frame drew over the screen, as holes in the video's
+    /// box (`pepper::holes`).
+    pub drawn_over: Vec<Rect>,
+    /// What Pepper was last told (`video_placement`).
+    placed: Option<pepper::Placed>,
 }
 
 /// Ctrl and an arrow or `h j k l`: the pane that way.
@@ -458,6 +521,14 @@ impl App {
             pending_g: false,
             needs_reload: false,
             clipboard: None,
+            tools: Tools::default(),
+            pepper: None,
+            pepper_holes: false,
+            playing: None,
+            plays: 0,
+            video_box: Cell::new(None),
+            drawn_over: Vec::new(),
+            placed: None,
         };
         if let Err(e) = hid {
             app.error(format!("Couldn't hide what your blocked words name: {e:#}"));
@@ -493,6 +564,7 @@ impl App {
                 }
                 break;
             }
+            write_to_terminal(&self.video_placement());
             self.images.fetch();
             tokio::select! {
                 event = keys.next() => match event {
@@ -531,7 +603,60 @@ impl App {
                 self.reload();
             }
         }
+        self.stop_video();
+        write_to_terminal(&self.video_placement());
         result
+    }
+
+    /// What to tell Pepper after a frame: where the video playing inside it
+    /// goes now (`OSC 777;pepper`), or that it's gone, if that changed.
+    /// Pepper tells pepper-play the box's size in pixels itself. Under a
+    /// popup, the picture plays on around it where Pepper takes holes
+    /// (`picture_shown`), else it's taken away: it would cover it. Returns
+    /// the escape sequences, written after the frame; empty when nothing
+    /// changed.
+    pub fn video_placement(&mut self) -> String {
+        let token = self.playing.as_ref().and_then(|p| p.pepper.clone());
+        let area = self.video_box.get().filter(|_| self.picture_shown());
+        let wanted = token.zip(area).map(|(token, area)| pepper::Placed {
+            token,
+            area,
+            holes: if self.pepper_holes {
+                pepper::holes(area, &self.drawn_over)
+            } else {
+                Vec::new()
+            },
+        });
+        if wanted == self.placed {
+            return String::new();
+        }
+        let mut out = String::new();
+        if let Some(old) = &self.placed
+            && wanted.as_ref().is_none_or(|new| new.token != old.token)
+        {
+            out.push_str(&pepper::remove(&old.token));
+        }
+        if let Some(new) = &wanted {
+            out.push_str(&pepper::place(&new.token, new.area, &new.holes));
+        }
+        self.placed = wanted;
+        out
+    }
+
+    /// Whether Pepper shows the video playing where it's laid out: with no
+    /// popup open, or with one where Pepper takes holes for it (an older
+    /// Pepper's picture would cover it, so it's taken away).
+    pub fn picture_shown(&self) -> bool {
+        self.pepper_holes || !self.popup_open()
+    }
+
+    /// Whether the video playing fills the tab, inside Pepper (`f`).
+    pub fn fills_tab(&self) -> bool {
+        self.reader.is_some()
+            && self
+                .playing
+                .as_ref()
+                .is_some_and(|p| p.inside() && p.fullscreen)
     }
 
     // Messages.
@@ -577,6 +702,7 @@ impl App {
                 result,
             } => self.on_found(&asked, into, result),
             AppEvent::Opml { path, result } => self.on_opml(&path, result),
+            AppEvent::Player(event) => self.on_player(event),
             AppEvent::Quit => self.quit = true,
         }
     }
@@ -1337,6 +1463,8 @@ impl App {
     }
 
     fn open(&mut self, article: Article) {
+        // Its video goes with the article it was in.
+        self.stop_video();
         self.mark_read(std::slice::from_ref(&article.id));
         if self.settings.history
             && let Err(e) = self.store.opened(&article.id, now())
@@ -1350,6 +1478,7 @@ impl App {
             scroll: 0,
             max_scroll: Cell::new(0),
             page: Cell::new(10),
+            videos_shown: Vec::new(),
         });
     }
 
@@ -1359,18 +1488,24 @@ impl App {
         if !self.settings.full_text {
             return Body::Summary;
         }
-        // A copy kept before pictures were is read from the page again.
+        // A copy kept before videos were is read from the page again, for
+        // them; while it can't be, it shows as it was.
+        let mut older = None;
         match self.store.body(&article.id) {
             Ok(Some(stored)) => {
                 if let Some(blocks) = Block::decode(&stored) {
                     return Body::Text(blocks);
                 }
+                older = Block::decode_older(&stored);
             }
             Ok(None) => {}
             Err(e) => self.error(format!("Couldn't read the kept text: {e:#}")),
         }
         if !article.link.starts_with("https://") {
-            return Body::Failed("its page isn't on https, so tuinews doesn't fetch it".into());
+            return match older {
+                Some(blocks) => Body::Text(blocks),
+                None => Body::Failed("its page isn't on https, so tuinews doesn't fetch it".into()),
+            };
         }
         let (client, tx) = (self.http.clone(), self.tx.clone());
         let (id, link) = (article.id.clone(), article.link.clone());
@@ -1396,20 +1531,221 @@ impl App {
                 }
                 Body::Text(blocks)
             }
-            Ok(_) => Body::Failed("no text was found on its page".into()),
-            Err(e) => Body::Failed(format!("{e:#}")),
+            // A copy kept before videos were, as it was, rather than none.
+            failed => match self
+                .store
+                .body(id)
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(Block::decode_older)
+            {
+                Some(blocks) => Body::Text(blocks),
+                None => Body::Failed(match failed {
+                    Ok(_) => "no text was found on its page".into(),
+                    Err(e) => format!("{e:#}"),
+                }),
+            },
         };
         if let Some(reader) = self.reader.as_mut()
             && reader.article.id == *id
         {
             reader.body = body;
+            // A video playing that the text no longer holds plays nowhere.
+            let gone = self.playing.as_ref().is_some_and(|playing| {
+                !matches!(&reader.body, Body::Text(blocks)
+                    if blocks.contains(&Block::Video(playing.video.clone())))
+            });
+            if gone {
+                self.stop_video();
+            }
         }
     }
 
-    /// The reader closes.
+    /// The reader closes, and the video playing in it stops.
     fn close_reader(&mut self) {
+        self.stop_video();
         self.reader = None;
         self.needs_reload = true;
+    }
+
+    // Videos.
+
+    /// The video Enter plays: of those the last frame showed, the first
+    /// shown whole, else the first shown at all.
+    fn video_in_view(&self) -> Option<Video> {
+        self.reader.as_ref()?.videos_shown.first().cloned()
+    }
+
+    /// pepper-play and Pepper's port, when the video plays inside the
+    /// terminal: in Pepper, with `inline_video` on and pepper-play found.
+    fn inline_player(&self) -> Option<(PathBuf, OsString)> {
+        if !self.settings.inline_video {
+            return None;
+        }
+        Some((self.tools.pepper_play.clone()?, self.pepper.clone()?))
+    }
+
+    /// Plays `video`, of the article in the reader: inside Pepper in its box
+    /// (filling the tab with `f`), else in mpv's window.
+    fn play_video(&mut self, video: Video) {
+        let Some(title) = self.reader.as_ref().map(|r| r.article.title.clone()) else {
+            return;
+        };
+        // One proxy for everything, and mpv can't be kept to one: an HLS
+        // playlist can name an `httpproxy://` part, which FFmpeg reaches on
+        // its own, around the proxy (measured). So with one, nothing plays.
+        if let Some(proxy) = crate::proxy::get() {
+            return self.error(format!(
+                "Videos don't play through a proxy ({}): mpv could be led around it, \
+                 and tuinews won't go around it. o opens the article in your browser",
+                proxy.from
+            ));
+        }
+        // Inside Pepper only with a token to place its box with.
+        let inside = self
+            .inline_player()
+            .and_then(|(program, port)| Some((program, port, pepper::new_token()?)));
+        let program = match (&inside, &self.tools.mpv) {
+            (Some((program, ..)), _) | (None, Some(program)) => program.clone(),
+            // pepper-play is there, but no token to place its box with (the
+            // system's randomness can't be read): not mpv's fault.
+            (None, None) if self.inline_player().is_some() => {
+                return self.error(
+                    "The video can't be placed in Pepper: this system's randomness can't be read",
+                );
+            }
+            (None, None) => {
+                return self.error(format!(
+                    "Videos play in mpv, which isn't here: {} (o opens the article in your browser)",
+                    Tools::mpv_hint()
+                ));
+            }
+        };
+        self.stop_video();
+        self.plays += 1;
+        let start = player::Start {
+            program: &program,
+            url: &video.url,
+            title: &title,
+            pepper: inside
+                .as_ref()
+                .map(|(_, port, token)| player::Pepper { port, token }),
+        };
+        match Player::start(self.plays, start, self.tx.clone()) {
+            Ok(player) => {
+                let pepper = inside.map(|(.., token)| token);
+                self.info(match (&pepper, player.controllable()) {
+                    (Some(_), _) => "Playing · Enter pauses · f fills the tab · x stops",
+                    (None, true) => {
+                        "Playing in mpv's window · Enter pauses · f full screen · x stops"
+                    }
+                    (None, false) => "Playing in mpv's window · x stops",
+                });
+                self.playing = Some(Playing {
+                    player,
+                    video,
+                    fullscreen: false,
+                    pepper,
+                    position: 0.0,
+                    duration: None,
+                    paused: false,
+                    started: false,
+                    failed: false,
+                    ended: false,
+                });
+            }
+            Err(e) => self.error(format!("Couldn't play the video: {e:#}")),
+        }
+    }
+
+    /// Stops the video playing, if one is.
+    pub fn stop_video(&mut self) {
+        if let Some(mut playing) = self.playing.take() {
+            playing.player.stop();
+        }
+    }
+
+    /// Enter in the reader: plays the video shown, or pauses or plays it if
+    /// it's the one playing; with none shown, the one playing. With no
+    /// video, false.
+    fn enter_video(&mut self) -> bool {
+        let shown = self.video_in_view();
+        let playing = self.playing.as_ref().map(|p| p.video.clone());
+        match (shown, playing) {
+            (Some(shown), Some(playing)) if shown != playing => self.play_video(shown),
+            (_, Some(_)) => self.toggle_pause(),
+            (Some(shown), None) => self.play_video(shown),
+            (None, None) => return false,
+        }
+        true
+    }
+
+    fn toggle_pause(&mut self) {
+        match &self.playing {
+            Some(playing) if playing.player.controllable() => playing.player.toggle_pause(),
+            Some(_) => self.info("Pause it in mpv's window (Space)"),
+            None => {}
+        }
+    }
+
+    /// `f`: the video playing fills the tab (inside Pepper) or the screen
+    /// (mpv's window), or goes back. With none playing, false: `f` pages,
+    /// as always, rather than start one that scrolled into view.
+    fn fullscreen_video(&mut self) -> bool {
+        let Some(playing) = self.playing.as_mut() else {
+            return false;
+        };
+        if playing.inside() {
+            playing.fullscreen = !playing.fullscreen;
+        } else if playing.player.controllable() {
+            playing.player.toggle_fullscreen();
+        } else {
+            self.info("Make it fill the screen in mpv's window (f)");
+        }
+        true
+    }
+
+    fn seek_video(&mut self, seconds: i32) {
+        if let Some(playing) = &self.playing
+            && playing.player.controllable()
+        {
+            playing.player.seek(seconds);
+        }
+    }
+
+    fn on_player(&mut self, event: PlayerEvent) {
+        let Some(playing) = self
+            .playing
+            .as_mut()
+            .filter(|p| p.player.play == event.play)
+        else {
+            return;
+        };
+        match event.kind {
+            PlayerEventKind::Position(at) => playing.position = at,
+            PlayerEventKind::Duration(length) => playing.duration = Some(length),
+            PlayerEventKind::Paused(paused) => playing.paused = paused,
+            PlayerEventKind::Restarted => playing.started = true,
+            PlayerEventKind::Failed => playing.failed = true,
+            // mpv quits after it (`--idle=once`).
+            PlayerEventKind::Ended => playing.ended = true,
+            PlayerEventKind::Exited => {
+                let (failed, started, ended) = (playing.failed, playing.started, playing.ended);
+                let inside = playing.inside();
+                self.playing = None;
+                if failed {
+                    self.error("The video couldn't be played: its stream didn't open");
+                } else if !started && ended {
+                    self.error("The video ended before it played: its stream held nothing");
+                } else if !started && inside {
+                    self.error(format!(
+                        "pepper-play stopped before the video played (is mpv installed? {})",
+                        Tools::mpv_hint()
+                    ));
+                }
+            }
+        }
     }
 
     /// `]` / `[` in the reader: the next or the one before in the list.
@@ -1641,6 +1977,10 @@ impl App {
                 self.settings.full_text = !self.settings.full_text;
                 self.save_setting("full_text", self.settings.full_text.into());
             }
+            HelpMenu::INLINE_VIDEO => {
+                self.settings.inline_video = !self.settings.inline_video;
+                self.save_setting("inline_video", self.settings.inline_video.into());
+            }
             HelpMenu::HISTORY => {
                 self.settings.history = !self.settings.history;
                 self.save_setting("history", self.settings.history.into());
@@ -1773,6 +2113,10 @@ impl App {
                     self.category_menu.as_mut().and_then(|m| m.naming.as_mut())
                 {
                     naming.typed.paste(&line, spaced, store::MAX_CATEGORY_NAME);
+                } else if self.fills_tab() {
+                    // The video fills the tab: a box opened behind it would
+                    // take the keys unseen.
+                    self.info("Pasted text goes in a box: f or Esc leaves the full screen first");
                 } else if !self.popup_open() {
                     // A link pasted with no box open, or a file's path (one
                     // dropped on the terminal): the box to add it.
@@ -1834,6 +2178,9 @@ impl App {
         }
         if self.category_menu.is_some() {
             return self.on_category_key(key);
+        }
+        if self.fills_tab() {
+            return self.on_fullscreen_key(key, ctrl);
         }
         if key.code == KeyCode::Char('F') && !ctrl {
             return self.open_categories();
@@ -1992,6 +2339,19 @@ impl App {
     }
 
     fn on_reader_key(&mut self, key: KeyEvent, ctrl: bool) {
+        // The video's keys, when there's one; else what they always do.
+        let video = match key.code {
+            KeyCode::Enter => self.enter_video(),
+            KeyCode::Char('f') if !ctrl => self.fullscreen_video(),
+            KeyCode::Char('x') if !ctrl && self.playing.is_some() => {
+                self.stop_video();
+                true
+            }
+            _ => false,
+        };
+        if video {
+            return;
+        }
         let Some(reader) = self.reader.as_mut() else {
             return;
         };
@@ -2025,6 +2385,29 @@ impl App {
             KeyCode::Char('y') => self.copy_link(),
             KeyCode::Char('?') => self.help = Some(HelpMenu::new(HelpTab::Keys)),
             KeyCode::Char('O') => self.help = Some(HelpMenu::new(HelpTab::Settings)),
+            _ => {}
+        }
+    }
+
+    /// Keys while the video fills the tab, inside Pepper: the player's, as
+    /// mpv's own, and `f`, Esc or `q` back to the article.
+    fn on_fullscreen_key(&mut self, key: KeyEvent, ctrl: bool) {
+        if ctrl {
+            return;
+        }
+        match key.code {
+            KeyCode::Char('f' | 'q') | KeyCode::Esc => {
+                if let Some(playing) = self.playing.as_mut() {
+                    playing.fullscreen = false;
+                }
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_pause(),
+            KeyCode::Left | KeyCode::Char('h') => self.seek_video(-5),
+            KeyCode::Right | KeyCode::Char('l') => self.seek_video(5),
+            KeyCode::Down | KeyCode::Char('j') => self.seek_video(-60),
+            KeyCode::Up | KeyCode::Char('k') => self.seek_video(60),
+            KeyCode::Char('x') => self.stop_video(),
+            KeyCode::Char('?') => self.help = Some(HelpMenu::new(HelpTab::Keys)),
             _ => {}
         }
     }
@@ -2174,8 +2557,15 @@ impl App {
 
 /// Opens `url` (a link `article::checked_link` passed) in the browser.
 /// The opener gets it on its command line: browsers take URLs no other way.
+/// Never from a test.
 fn open_url(url: &str) -> std::io::Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
     if cfg!(any(target_os = "macos", windows)) {
+        // One program starting at a time, as `tools::starting` says: none
+        // may start while the player's socketpair isn't close-on-exec yet.
+        let _starting = crate::tools::starting();
         return open::that_detached(url);
     }
     let opener = crate::tools::on_path("xdg-open").ok_or_else(|| {
@@ -2202,6 +2592,19 @@ fn open_url(url: &str) -> std::io::Result<()> {
     };
     std::thread::spawn(move || child.wait());
     Ok(())
+}
+
+/// Writes escape sequences tuinews makes itself to the terminal, between
+/// frames: Pepper's (`pepper::place`, `pepper::remove`), only ever a token
+/// and numbers.
+fn write_to_terminal(sequences: &str) {
+    use std::io::Write;
+    if sequences.is_empty() {
+        return;
+    }
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(sequences.as_bytes());
+    let _ = out.flush();
 }
 
 /// Asks the terminal to put `text` on the clipboard (OSC 52). Only ever a
@@ -2778,5 +3181,227 @@ pub mod tests {
     fn base64_pads_as_the_terminal_wants() {
         assert_eq!(base64(b"https://a.vn"), "aHR0cHM6Ly9hLnZu");
         assert_eq!(base64(b"ab"), "YWI=");
+    }
+
+    /// The reader open on the newest article, its text a paragraph and a
+    /// video, the video shown (as a frame would note it).
+    pub fn reading_a_video(app: &mut App) -> Video {
+        app.close_reader();
+        app.settings.full_text = false;
+        app.focus = Focus::Grid;
+        app.on_key(key(KeyCode::Enter));
+        let video = Video {
+            url: "https://v.vnecdn.net/vnexpress/video/a.mp4".into(),
+            poster: None,
+        };
+        let reader = app.reader.as_mut().expect("open");
+        reader.body = Body::Text(vec![
+            Block::Paragraph("Đoạn đầu.".into()),
+            Block::Video(video.clone()),
+        ]);
+        reader.videos_shown = vec![video.clone()];
+        video
+    }
+
+    /// `video` playing, with a pretend player behind it: inside Pepper (its
+    /// token `tok`), or in mpv's window.
+    pub fn play(app: &mut App, video: &Video, inside: bool) {
+        app.plays += 1;
+        app.playing = Some(Playing {
+            player: Player::pretend(app.plays),
+            video: video.clone(),
+            pepper: inside.then(|| "tok".into()),
+            position: 0.0,
+            duration: None,
+            paused: false,
+            started: true,
+            failed: false,
+            ended: false,
+            fullscreen: false,
+        });
+    }
+
+    #[test]
+    fn enter_plays_the_video_shown_and_says_where_mpv_comes_from() {
+        let mut app = app();
+        reading_a_video(&mut app);
+        app.on_key(key(KeyCode::Enter));
+        let status = app.status.as_ref().expect("said").text.clone();
+        assert!(status.contains(Tools::mpv_hint()), "{status}");
+        assert!(app.reader.is_some(), "the article stays open");
+        assert!(app.playing.is_none());
+    }
+
+    #[test]
+    fn f_fills_the_tab_inside_pepper_and_its_keys_are_the_players() {
+        let mut app = app();
+        let video = reading_a_video(&mut app);
+        play(&mut app, &video, true);
+        assert!(!app.fills_tab());
+        app.on_key(key(KeyCode::Char('f')));
+        assert!(app.fills_tab());
+        // The article behind doesn't move, nor close.
+        for k in [KeyCode::Char('j'), KeyCode::Char(' '), KeyCode::Right] {
+            app.on_key(key(k));
+        }
+        assert_eq!(app.reader.as_ref().unwrap().scroll, 0);
+        app.on_key(key(KeyCode::Esc));
+        assert!(!app.fills_tab(), "Esc leaves the full screen first");
+        assert!(app.reader.is_some());
+        app.on_key(key(KeyCode::Char('f')));
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.playing.is_none(), "x stops it");
+        assert!(!app.fills_tab());
+    }
+
+    #[test]
+    fn in_mpvs_window_f_is_mpvs_full_screen_and_windows_says_so() {
+        let mut app = app();
+        let video = reading_a_video(&mut app);
+        play(&mut app, &video, false);
+        app.on_key(key(KeyCode::Char('f')));
+        assert!(
+            !app.fills_tab(),
+            "mpv's window fills the screen, not the tab"
+        );
+        app.status = None;
+        app.playing.as_mut().unwrap().player.set_controllable(false);
+        app.on_key(key(KeyCode::Char('f')));
+        let status = app.status.as_ref().expect("said").text.clone();
+        assert!(status.contains("mpv's window"), "{status}");
+    }
+
+    #[test]
+    fn a_paste_over_the_full_screen_opens_no_box_behind_it() {
+        let mut app = app();
+        let video = reading_a_video(&mut app);
+        play(&mut app, &video, true);
+        app.on_key(key(KeyCode::Char('f')));
+        app.on_terminal_events(vec![Event::Paste("https://genk.vn/rss/home.rss".into())]);
+        assert!(app.prompt.is_none(), "no box the keys would go to unseen");
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.playing.is_none(), "the player's keys still work");
+    }
+
+    #[test]
+    fn until_a_video_plays_f_pages_down_as_always() {
+        let mut app = app();
+        reading_a_video(&mut app);
+        let reader = app.reader.as_mut().unwrap();
+        reader.max_scroll.set(40);
+        reader.page.set(10);
+        // A poster scrolled into view doesn't start playing on `f`.
+        app.on_key(key(KeyCode::Char('f')));
+        assert_eq!(app.reader.as_ref().unwrap().scroll, 8);
+        assert!(app.playing.is_none());
+        assert!(app.status.is_none(), "no player was looked for");
+    }
+
+    #[test]
+    fn a_text_kept_before_videos_shows_while_its_page_cant_be_read() {
+        let mut app = app();
+        let video = reading_a_video(&mut app);
+        let id = app.reader.as_ref().unwrap().article.id.clone();
+        app.store.save_body(&id, "v 2\np Đoạn đã giữ.", 1).unwrap();
+        play(&mut app, &video, true);
+        app.on_page(&id, Err(anyhow::anyhow!("offline")));
+        assert_eq!(
+            app.reader.as_ref().unwrap().body,
+            Body::Text(vec![Block::Paragraph("Đoạn đã giữ.".into())]),
+            "the copy as it was, not an error"
+        );
+        assert!(
+            app.playing.is_none(),
+            "the video playing isn't in the text any more: it stops"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_ends_before_it_plays_says_so() {
+        let mut app = app();
+        let video = reading_a_video(&mut app);
+        play(&mut app, &video, true);
+        let playing = app.playing.as_mut().unwrap();
+        playing.started = false;
+        let play_now = app.plays;
+        for kind in [PlayerEventKind::Ended, PlayerEventKind::Exited] {
+            app.on_event(AppEvent::Player(PlayerEvent {
+                play: play_now,
+                kind,
+            }));
+        }
+        let said = app.status.as_ref().expect("said").text.clone();
+        assert!(said.contains("ended before it played"), "{said}");
+    }
+
+    #[test]
+    fn the_video_stops_with_its_article() {
+        let mut app = app();
+        let video = reading_a_video(&mut app);
+        play(&mut app, &video, true);
+        app.on_key(key(KeyCode::Char(']')));
+        assert!(app.playing.is_none(), "another article");
+        let video = reading_a_video(&mut app);
+        play(&mut app, &video, false);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.playing.is_none(), "the reader closed");
+    }
+
+    #[test]
+    fn what_the_player_says_is_kept_for_its_own_playback_only() {
+        let mut app = app();
+        let video = reading_a_video(&mut app);
+        play(&mut app, &video, true);
+        let play_now = app.plays;
+        let say = |app: &mut App, play: u64, kind: PlayerEventKind| {
+            app.on_event(AppEvent::Player(PlayerEvent { play, kind }));
+        };
+        say(&mut app, play_now, PlayerEventKind::Position(12.0));
+        say(&mut app, play_now, PlayerEventKind::Duration(81.0));
+        say(&mut app, play_now, PlayerEventKind::Paused(true));
+        say(&mut app, play_now - 1, PlayerEventKind::Position(99.0));
+        say(&mut app, play_now - 1, PlayerEventKind::Exited);
+        let playing = app
+            .playing
+            .as_ref()
+            .expect("an old one's end isn't this one's");
+        assert_eq!((playing.position, playing.duration), (12.0, Some(81.0)));
+        assert!(playing.paused);
+        say(&mut app, play_now, PlayerEventKind::Failed);
+        say(&mut app, play_now, PlayerEventKind::Exited);
+        assert!(app.playing.is_none());
+        assert!(app.status.as_ref().unwrap().error);
+    }
+
+    #[test]
+    fn pepper_is_told_where_the_video_goes_once_and_when_its_gone() {
+        let mut app = app();
+        let video = reading_a_video(&mut app);
+        let area = Rect::new(30, 10, 64, 18);
+        app.video_box.set(Some(area));
+        assert_eq!(app.video_placement(), "", "nothing plays inside Pepper");
+        play(&mut app, &video, true);
+        assert_eq!(app.video_placement(), pepper::place("tok", area, &[]));
+        assert_eq!(app.video_placement(), "", "said once");
+        // An older Pepper's picture would cover a popup: taken away.
+        app.help = Some(HelpMenu::new(HelpTab::Keys));
+        assert_eq!(app.video_placement(), pepper::remove("tok"));
+        app.help = None;
+        assert_eq!(app.video_placement(), pepper::place("tok", area, &[]));
+        // One that takes holes plays on around it.
+        app.pepper_holes = true;
+        app.help = Some(HelpMenu::new(HelpTab::Keys));
+        let popup = Rect::new(40, 5, 50, 20);
+        app.drawn_over = vec![popup];
+        assert_eq!(
+            app.video_placement(),
+            pepper::place("tok", area, &[popup.intersection(area)])
+        );
+        app.stop_video();
+        assert_eq!(app.video_placement(), pepper::remove("tok"));
+        assert_eq!(app.video_placement(), "", "said once");
+        // In mpv's window, Pepper is told nothing.
+        play(&mut app, &video, false);
+        assert_eq!(app.video_placement(), "");
     }
 }

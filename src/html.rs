@@ -6,7 +6,7 @@
 //! and what's left goes through `article::lines`, so nothing in it can
 //! reach the terminal as anything but text.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ego_tree::NodeRef;
 use scraper::{ElementRef, Html, Node};
@@ -182,18 +182,33 @@ pub enum Block {
     /// A picture in the text: its address, checked and over https
     /// (`feed::picture_url`).
     Picture(String),
+    /// A video in the text, played on Enter.
+    Video(Video),
+}
+
+/// A video of an article: where it streams from (a file or an HLS
+/// playlist), checked and over https ([`video_url`]), and the picture shown
+/// until it plays, checked as a picture is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Video {
+    pub url: String,
+    pub poster: Option<String>,
 }
 
 /// What the store's copy of an article's text starts with. Copies without
-/// it were made before pictures were kept, and are read from the page again.
-const STORED: &str = "v 2";
+/// it were made before videos were kept, and are read from the page again.
+const STORED: &str = "v 3";
+/// What a copy made before videos were kept starts with: the same lines, no
+/// videos. Shown while its page can't be read again (`Block::decode_older`):
+/// a feed's own text, or a page that's gone, can't be.
+const STORED_BEFORE_VIDEOS: &str = "v 2";
 
 impl Block {
-    /// Its words; a picture has none.
+    /// Its words; a picture or a video has none.
     pub fn text(&self) -> &str {
         match self {
             Block::Paragraph(t) | Block::Heading(t) | Block::Aside(t) => t,
-            Block::Picture(_) => "",
+            Block::Picture(_) | Block::Video(_) => "",
         }
     }
 
@@ -206,16 +221,30 @@ impl Block {
                 Block::Heading(t) => format!("h {t}"),
                 Block::Aside(t) => format!("a {t}"),
                 Block::Picture(url) => format!("i {url}"),
+                Block::Video(Video { url, poster }) => match poster {
+                    Some(poster) => format!("v {url} {poster}"),
+                    None => format!("v {url}"),
+                },
             }))
             .collect::<Vec<_>>()
             .join("\n")
     }
 
     /// Blocks as [`Block::encode`] wrote them, cleaned and checked again;
-    /// `None` for a copy made before pictures were kept.
+    /// `None` for a copy made before videos were kept.
     pub fn decode(stored: &str) -> Option<Vec<Block>> {
+        Self::decode_marked(stored, STORED)
+    }
+
+    /// A copy made before videos were kept, as it was, for when its page
+    /// can't be read again for them.
+    pub fn decode_older(stored: &str) -> Option<Vec<Block>> {
+        Self::decode_marked(stored, STORED_BEFORE_VIDEOS)
+    }
+
+    fn decode_marked(stored: &str, marked: &str) -> Option<Vec<Block>> {
         let mut lines = stored.lines();
-        if lines.next() != Some(STORED) {
+        if lines.next() != Some(marked) {
             return None;
         }
         let blocks = lines
@@ -224,6 +253,18 @@ impl Block {
                 if mark == "i" {
                     let url = article::checked_link(text, None)?;
                     return url.starts_with("https://").then_some(Block::Picture(url));
+                }
+                if mark == "v" {
+                    let (url, poster) = match text.split_once(' ') {
+                        Some((url, poster)) => (url, Some(poster)),
+                        None => (text, None),
+                    };
+                    return Some(Block::Video(Video {
+                        url: video_url(url, None)?,
+                        poster: poster
+                            .and_then(|p| article::checked_link(p, None))
+                            .filter(|p| p.starts_with("https://")),
+                    }));
                 }
                 let text = article::one_line(text, MAX_BODY);
                 Some(match mark {
@@ -271,10 +312,12 @@ const NOT_ARTICLE: [&str; 6] = ["nav", "aside", "footer", "header", "form", "men
 
 /// An article's own text, from its page at `base`: the element holding the
 /// most paragraphs' text (as Firefox's reader view looks for it), then its
-/// paragraphs, headings, pictures and their captions in order. Empty when
-/// there's none, a page that's all pictures or video.
+/// paragraphs, headings, pictures, videos and their captions in order.
+/// Empty when there's none, a page that's all pictures; a page that's a
+/// video alone, the video its data names ([`named_videos`]).
 pub fn article_text(page: &str, base: &str) -> Vec<Block> {
     let document = Html::parse_document(page);
+    let named = named_videos(&document, base);
     let paragraphs: Vec<ElementRef> = document
         .root_element()
         .descendants()
@@ -308,14 +351,66 @@ pub fn article_text(page: &str, base: &str) -> Vec<Block> {
         .and_then(|(id, _)| document.tree.get(*id))
         .and_then(ElementRef::wrap)
     else {
-        return Vec::new();
+        return named.into_iter().take(1).map(Block::Video).collect();
+    };
+    // The text's videos, each with the box it's shown in on the page: the
+    // pictures there are its poster, the paragraphs its caption.
+    let page = reqwest::Url::parse(base).ok();
+    let mut videos: HashMap<ego_tree::NodeId, Block> = HashMap::new();
+    let mut boxes: HashSet<ego_tree::NodeId> = HashSet::new();
+    for element in best.descendants().filter_map(ElementRef::wrap) {
+        if videos.len() >= MAX_VIDEOS {
+            break;
+        }
+        // Most elements are no video: the walks above them only for those
+        // that are. A <video> in a player already found is that player's.
+        if !plays_video(&element) {
+            continue;
+        }
+        let parent = element.parent().and_then(ElementRef::wrap);
+        let found_in = near(
+            element
+                .ancestors()
+                .filter_map(ElementRef::wrap)
+                .take_while(|a| a.id() != best.id()),
+            |a| boxes.contains(&a.id()),
+        );
+        let outside =
+            parent.is_none_or(|parent| outside_article(&parent) || marked_aside(&parent, &best));
+        if found_in || outside {
+            continue;
+        }
+        if let Some((block, boxed)) = video_of(&element, &best, page.as_ref(), base, &named) {
+            boxes.insert(boxed);
+            videos.insert(element.id(), block);
+        }
+    }
+    // No walk up from each picture and paragraph on a page with no video.
+    let in_box = |element: &ElementRef| {
+        !boxes.is_empty()
+            && near(
+                std::iter::once(*element)
+                    .chain(element.ancestors().filter_map(ElementRef::wrap))
+                    .take_while(|a| a.id() != best.id()),
+                |a| boxes.contains(&a.id()),
+            )
     };
     let mut blocks: Vec<Block> = Vec::new();
     let mut length = 0;
     let mut pictures = 0;
     for element in best.descendants().filter_map(ElementRef::wrap) {
+        if let Some(block) = videos.remove(&element.id()) {
+            // A moving picture is a picture: kept within the same number.
+            let picture = matches!(block, Block::Picture(_));
+            if !blocks.contains(&block) && (!picture || pictures < MAX_PICTURES) {
+                pictures += usize::from(picture);
+                blocks.push(block);
+            }
+            continue;
+        }
         if element.value().name() == "img" {
             if pictures < MAX_PICTURES
+                && !in_box(&element)
                 && !outside_article(&element)
                 && !marked_aside(&element, &best)
                 && let Some(url) = picture_of(&element, &best, base)
@@ -327,6 +422,8 @@ pub fn article_text(page: &str, base: &str) -> Vec<Block> {
             continue;
         }
         let block = match element.value().name() {
+            // A video's words are its caption.
+            "p" | "li" if in_box(&element) => Block::Aside,
             "p" | "li" => Block::Paragraph,
             "h2" | "h3" | "h4" => Block::Heading,
             "figcaption" | "blockquote" => Block::Aside,
@@ -353,7 +450,269 @@ pub fn article_text(page: &str, base: &str) -> Vec<Block> {
             break;
         }
     }
+    // A page whose video plays above its text (VnExpress's, VTC News's
+    // video pages) names it only in its data: at the top.
+    if !blocks.iter().any(|b| matches!(b, Block::Video(_)))
+        && let Some(video) = named.into_iter().next()
+    {
+        blocks.insert(0, Block::Video(video));
+    }
     blocks
+}
+
+/// Videos of an article kept, at most.
+const MAX_VIDEOS: usize = 10;
+/// The biggest of a page's data (`application/ld+json`) read for its videos.
+const MAX_DATA: usize = 256 * 1024;
+/// What a video's address ends with: a file mpv plays as it is, or an HLS
+/// playlist. Anything else (a page, an embedded player) isn't one.
+const VIDEO_FILES: [&str; 5] = [".mp4", ".m4v", ".webm", ".mov", ".m3u8"];
+
+/// A video's address as tuinews plays it: checked as a link is
+/// (`article::checked_link`, relative to `base`), over https (one on http
+/// is asked for on https, as pictures are), and a file or playlist by its
+/// name ([`VIDEO_FILES`]).
+pub fn video_url(url: &str, base: Option<&reqwest::Url>) -> Option<String> {
+    let mut url = reqwest::Url::parse(&article::checked_link(url, base)?).ok()?;
+    if url.scheme() == "http" {
+        url.set_scheme("https").ok()?;
+    }
+    let path = url.path().to_ascii_lowercase();
+    VIDEO_FILES
+        .iter()
+        .any(|ext| path.ends_with(ext))
+        .then(|| url.to_string())
+}
+
+/// The videos a page's data says are its own (`<script
+/// type="application/ld+json">`, schema.org's `VideoObject`): its address
+/// (`contentUrl`) and picture (`thumbnailUrl`). Dân Trí's `<video>` names
+/// its file by a path that isn't where it streams from; VTC News's player
+/// is made by a script. Its own: one at the data's top (or in a list
+/// there, or its `@graph`), or the `video` of an entity there (Dân Trí's
+/// `NewsArticle`); not one deeper, in a list of others (an `ItemList`).
+fn named_videos(document: &Html, base: &str) -> Vec<Video> {
+    use serde_json::Value;
+    let page = reqwest::Url::parse(base).ok();
+    let mut found: Vec<Video> = Vec::new();
+    let scripts = document
+        .root_element()
+        .descendants()
+        .filter_map(ElementRef::wrap)
+        .filter(|e| {
+            e.value().name() == "script"
+                && e.attr("type")
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/ld+json"))
+        });
+    for script in scripts {
+        // Measured as it's read: a page's megabytes aren't copied to be
+        // thrown away.
+        let mut data = String::new();
+        for piece in script.text() {
+            if data.len() + piece.len() > MAX_DATA {
+                data.clear();
+                break;
+            }
+            data.push_str(piece);
+        }
+        if data.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        let entities: Vec<&Value> = listed(Some(&value))
+            .into_iter()
+            .flat_map(|top| std::iter::once(top).chain(listed(top.get("@graph"))))
+            .collect();
+        let own = entities
+            .iter()
+            .flat_map(|&entity| std::iter::once(entity).chain(listed(entity.get("video"))));
+        for video in own {
+            if found.len() >= MAX_VIDEOS {
+                break;
+            }
+            if is_video_object(video)
+                && let Some(url) = first_text(video.get("contentUrl"))
+                    .and_then(|url| video_url(url, page.as_ref()))
+                && !found.iter().any(|v| v.url == url)
+            {
+                let poster = first_text(video.get("thumbnailUrl"))
+                    .and_then(|p| crate::feed::picture_url(p, base));
+                found.push(Video { url, poster });
+            }
+        }
+    }
+    found
+}
+
+/// A value of a page's data as a list: the items of a list, or the value
+/// alone; none for none.
+fn listed(value: Option<&serde_json::Value>) -> Vec<&serde_json::Value> {
+    match value {
+        Some(serde_json::Value::Array(items)) => items.iter().collect(),
+        Some(serde_json::Value::Null) | None => Vec::new(),
+        Some(one) => vec![one],
+    }
+}
+
+/// Whether `element` plays a video on the page: a `<video>`, or VCCorp's
+/// player.
+fn plays_video(element: &ElementRef) -> bool {
+    let value = element.value();
+    value.name() == "video"
+        || value
+            .attr("type")
+            .is_some_and(|t| t.eq_ignore_ascii_case("VideoStream"))
+}
+
+/// Whether a value of a page's data is a video: its `@type` is, or lists,
+/// `VideoObject` (or schema.org's whole name for it, `…/VideoObject`), not
+/// any name that ends so.
+fn is_video_object(value: &serde_json::Value) -> bool {
+    let is = |t: &serde_json::Value| {
+        t.as_str().is_some_and(|t| {
+            t == "VideoObject" || t.ends_with("/VideoObject") || t.ends_with(":VideoObject")
+        })
+    };
+    match value.get("@type") {
+        Some(serde_json::Value::Array(types)) => types.iter().any(is),
+        Some(t) => is(t),
+        None => false,
+    }
+}
+
+/// A text, or the first of a list of them.
+fn first_text(value: Option<&serde_json::Value>) -> Option<&str> {
+    match value? {
+        serde_json::Value::String(text) => Some(text),
+        serde_json::Value::Array(items) => items.iter().find_map(serde_json::Value::as_str),
+        _ => None,
+    }
+}
+
+/// The video `element` of the article's `container` is, if it's one: a
+/// `<video>` (its `src`, `data-src` or a `<source>`'s) or VCCorp's player
+/// (Thanh Niên, Kenh14, GenK, Tuổi Trẻ: `type="VideoStream"`, its
+/// `data-vid` a host and a path), with its poster; and the box it's shown
+/// in. Where the page's data names a video of the same file, its address is
+/// taken: the element's may be a path the page's script turns into another.
+/// A `<video>` that plays on its own, muted, over and over is a moving
+/// picture (Tuổi Trẻ's GIFs): its poster, as a picture.
+fn video_of(
+    element: &ElementRef,
+    container: &ElementRef,
+    page: Option<&reqwest::Url>,
+    base: &str,
+    named: &[Video],
+) -> Option<(Block, ego_tree::NodeId)> {
+    let value = element.value();
+    let picture = |attr: &str| {
+        value
+            .attr(attr)
+            .and_then(|src| crate::feed::picture_url(src, base))
+    };
+    let (raw, poster) = if value.name() == "video" {
+        let poster = picture("poster").or_else(|| picture("data-poster"));
+        if value.attr("loop").is_some() && value.attr("muted").is_some() {
+            return Some((Block::Picture(poster?), element.id()));
+        }
+        let sources = element
+            .children()
+            .filter_map(ElementRef::wrap)
+            .filter(|e| e.value().name() == "source")
+            .flat_map(|e| [e.attr("src"), e.attr("data-src")]);
+        let raw = [value.attr("src"), value.attr("data-src")]
+            .into_iter()
+            .chain(sources)
+            .flatten()
+            .map(str::trim)
+            .find(|src| !src.is_empty() && !src.starts_with("blob:"))?;
+        (raw.to_string(), poster)
+    } else if plays_video(element) {
+        let vid = value.attr("data-vid")?.trim();
+        // A host and a path, as VCCorp writes it; a whole address, or a
+        // path on the site, as it is.
+        let raw = if vid.contains("://") || vid.starts_with('/') {
+            vid.to_string()
+        } else {
+            format!("https://{vid}")
+        };
+        (raw, picture("data-thumb"))
+    } else {
+        return None;
+    };
+    let file = file_stem(&raw);
+    let same = named.iter().find(|v| {
+        v.url == raw
+            || file.is_some_and(|file| {
+                reqwest::Url::parse(&v.url).is_ok_and(|u| u.path().contains(file))
+            })
+    });
+    let url = match same {
+        Some(video) => video.url.clone(),
+        None => video_url(&raw, page)?,
+    };
+    // A <video>'s box, once it's known to be one: VCCorp's player is its own.
+    let boxed = if value.name() == "video" {
+        video_box(element, container)
+    } else {
+        element.id()
+    };
+    let poster = poster
+        .or_else(|| same.and_then(|v| v.poster.clone()))
+        .or_else(|| poster_in(boxed, container, base));
+    Some((Block::Video(Video { url, poster }), boxed))
+}
+
+/// The name of the file a video's address names, without its extension,
+/// when it tells one file from another: long, with digits in it, as news
+/// sites name theirs (`fsavercom-1447956340609174-960p`), not a name every
+/// stream has (`playlist`, `master`, `manifest`).
+fn file_stem(url: &str) -> Option<&str> {
+    let path = url.split(['?', '#']).next()?;
+    let name = path.rsplit('/').next()?;
+    let stem = name.split('.').next()?;
+    (stem.len() >= 12 && stem.bytes().any(|b| b.is_ascii_digit())).then_some(stem)
+}
+
+/// The box a `<video>` is shown in, inside the article's `container`: what
+/// holds it and nothing else of the text, with at most one picture (the
+/// poster VnExpress shows until it plays).
+fn video_box(video: &ElementRef, container: &ElementRef) -> ego_tree::NodeId {
+    let text = ["p", "li", "h2", "h3", "h4", "blockquote", "figcaption"];
+    let mut boxed = video.id();
+    for above in video
+        .ancestors()
+        .filter_map(ElementRef::wrap)
+        .take(MAX_ANCESTORS)
+    {
+        if above.id() == container.id() {
+            break;
+        }
+        let (mut pictures, mut videos) = (0, 0);
+        let more = above.descendants().filter_map(ElementRef::wrap).any(|e| {
+            let name = e.value().name();
+            pictures += usize::from(name == "img");
+            videos += usize::from(name == "video");
+            text.contains(&name) || pictures > 1 || videos > 1
+        });
+        if more {
+            break;
+        }
+        boxed = above.id();
+    }
+    boxed
+}
+
+/// The picture in a video's box, its poster.
+fn poster_in(boxed: ego_tree::NodeId, container: &ElementRef, base: &str) -> Option<String> {
+    let boxed = ElementRef::wrap(container.tree().get(boxed)?)?;
+    boxed
+        .descendants()
+        .filter_map(ElementRef::wrap)
+        .filter(|e| e.value().name() == "img")
+        .find_map(|img| picture_of(&img, container, base))
 }
 
 /// The picture an `img` in the article's `container` shows, if it's one of
@@ -629,5 +988,260 @@ mod tests {
         // Kept and read back; a copy from before pictures is read again.
         assert_eq!(Block::decode(&Block::encode(&blocks)), Some(blocks));
         assert_eq!(Block::decode("p Một\nh Hai"), None);
+    }
+
+    /// A paragraph long enough to count, for pages in tests.
+    const LONG: &str = "Đoạn văn của bài báo, đủ dài để được tính là văn bản thật sự của nó.";
+
+    fn videos(blocks: &[Block]) -> Vec<&Video> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Video(v) => Some(v),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_video_in_the_text_comes_in_place_with_its_poster_and_caption() {
+        // VnExpress's: the poster an img beside the player, the title a div.
+        let page = format!(
+            r#"<html><body><article class="fck_detail"><p>{LONG}</p>
+            <figure><div class="box_embed_video_parent" data-vid="457106">
+              <div class="box_img_video"><img class="thumb-above-video"
+                src="https://iv1.vnecdn.net/vnexpress/images/web/2026/10/22/patriot.jpg?w=0"></div>
+              <div class="box_embed_video" style="display:none"><div id="video-457106">
+                <video id="media-video-457106" preload="auto" type="application/x-mpegURL"
+                  src="https://d1.vnecdn.net/vnexpress/video/web/mp4/,240p,360p,,/2026/10/22/patriot/vne/master.m3u8"></video>
+              </div><div class="parser_title">Patriot</div></div>
+            </div><figcaption><p class="Image">Kiev ngày 22/10. Video: Reuters</p></figcaption></figure>
+            <p>{LONG}</p></article></body></html>"#
+        );
+        let blocks = article_text(&page, "https://vnexpress.net/a-5136691.html");
+        assert_eq!(
+            blocks[1],
+            Block::Video(Video {
+                url: "https://d1.vnecdn.net/vnexpress/video/web/mp4/,240p,360p,,/2026/10/22/patriot/vne/master.m3u8".into(),
+                poster: Some("https://iv1.vnecdn.net/vnexpress/images/web/2026/10/22/patriot.jpg?w=0".into()),
+            }),
+            "{blocks:#?}"
+        );
+        assert_eq!(
+            blocks[2],
+            Block::Aside("Kiev ngày 22/10. Video: Reuters".into())
+        );
+        assert!(
+            !blocks.iter().any(|b| matches!(b, Block::Picture(_))),
+            "the poster isn't a picture of its own: {blocks:#?}"
+        );
+        // Kept and read back as it was.
+        assert_eq!(Block::decode(&Block::encode(&blocks)), Some(blocks));
+    }
+
+    #[test]
+    fn vccorps_player_names_its_file_by_host_and_path() {
+        // Thanh Niên's, Kenh14's, GenK's: the caption inside the player.
+        let page = format!(
+            r#"<html><body><div class="detail-content"><p>{LONG}</p>
+            <div class="VCSortableInPreviewMode" type="VideoStream" embed-type="4"
+              data-vid="kenh14cdn.com/2033/2026/10/26/flash-flood-1793000428.mp4"
+              data-thumb="https://kenh14cdn.com/.v-thumb/2033/2026/10/26/flash-flood-1793000428.mp4.jpg">
+              <div class="VideoCMS_Caption"><p>Clip: The Phuket Express</p></div></div>
+            <p>{LONG}</p></div></body></html>"#
+        );
+        let blocks = article_text(&page, "https://kenh14.vn/canh-tuong.chn");
+        assert_eq!(
+            videos(&blocks),
+            [&Video {
+                url: "https://kenh14cdn.com/2033/2026/10/26/flash-flood-1793000428.mp4".into(),
+                poster: Some(
+                    "https://kenh14cdn.com/.v-thumb/2033/2026/10/26/flash-flood-1793000428.mp4.jpg"
+                        .into()
+                ),
+            }]
+        );
+        assert_eq!(blocks[2], Block::Aside("Clip: The Phuket Express".into()));
+    }
+
+    #[test]
+    fn a_pages_data_names_where_its_video_streams_from() {
+        // Dân Trí's <video> names a path its script turns into another: the
+        // page's data has the address.
+        let data = r#"{"@context":"https://schema.org","@graph":[{"@type":"NewsArticle"},
+            {"@type":"VideoObject","thumbnailUrl":["https://cdnphoto.dantri.com.vn/x/thumb-video/fsavercom-1447956340609174/0.jpg"],
+             "contentUrl":"https://vcdn.dantri.com.vn/vod/2026/10/26/fsavercom-1447956340609174/playlist.m3u8"}]}"#;
+        let page = format!(
+            r#"<html><head><script type="application/ld+json">{data}</script></head><body>
+            <div data-slot="content"><figure class="video"><video
+              data-src="/2026/10/26/fsavercom-1447956340609174.mp4"></video>
+              <figcaption><p>Bán ô tô cũ (Video: Cục CSGT).</p></figcaption></figure>
+            <p>{LONG}</p><p>{LONG}</p></div></body></html>"#
+        );
+        let blocks = article_text(&page, "https://dantri.com.vn/o-to-xe-may/a.htm");
+        assert_eq!(
+            blocks[0],
+            Block::Video(Video {
+                url: "https://vcdn.dantri.com.vn/vod/2026/10/26/fsavercom-1447956340609174/playlist.m3u8".into(),
+                poster: Some("https://cdnphoto.dantri.com.vn/x/thumb-video/fsavercom-1447956340609174/0.jpg".into()),
+            })
+        );
+        assert_eq!(
+            blocks[1],
+            Block::Aside("Bán ô tô cũ (Video: Cục CSGT).".into())
+        );
+        // VTC News's player is made by a script: the video its data names
+        // goes first. A page with a video alone is that video.
+        let vtc = format!(
+            r#"<html><head><script type="application/ld+json">
+            {{"@type":"VideoObject","contentUrl":"https://cdn-v.vtcnews.vn/video/2026/10/26/5D90/5D90.mp4"}}
+            </script></head><body><article><p>{LONG}</p></article></body></html>"#
+        );
+        let blocks = article_text(&vtc, "https://vtcnews.vn/a-ar1047426.html");
+        assert_eq!(
+            blocks[0],
+            Block::Video(Video {
+                url: "https://cdn-v.vtcnews.vn/video/2026/10/26/5D90/5D90.mp4".into(),
+                poster: None,
+            })
+        );
+        let alone = vtc.replace(&format!("<p>{LONG}</p>"), "");
+        assert_eq!(article_text(&alone, "https://vtcnews.vn/a.html").len(), 1);
+    }
+
+    #[test]
+    fn only_videos_over_https_from_the_internet_play() {
+        let base = reqwest::Url::parse("https://vnexpress.net/a.html").unwrap();
+        let url = |u: &str| video_url(u, Some(&base));
+        assert_eq!(
+            url("http://v.vnecdn.net/a.mp4").as_deref(),
+            Some("https://v.vnecdn.net/a.mp4"),
+            "asked for on https"
+        );
+        assert_eq!(
+            url("/v/a.M3U8").as_deref(),
+            Some("https://vnexpress.net/v/a.M3U8")
+        );
+        for refused in [
+            "https://www.youtube.com/watch?v=abc",
+            "https://embed.vietnamnet.vn/v/124244.html",
+            "https://127.0.0.1/a.mp4",
+            "https://localhost/a.mp4",
+            "https://router.lan/a.mp4",
+            "file:///etc/a.mp4",
+            "https://user:pw@v.vnecdn.net/a.mp4",
+        ] {
+            assert_eq!(url(refused), None, "{refused}");
+        }
+        // Read back from the store, checked again.
+        assert_eq!(
+            Block::decode(
+                "v 3\nv https://127.0.0.1/a.mp4\nv https://v.vnecdn.net/a.mp4 http://x.vn/p.jpg"
+            ),
+            Some(vec![Block::Video(Video {
+                url: "https://v.vnecdn.net/a.mp4".into(),
+                poster: None,
+            })])
+        );
+        // A copy kept before videos were is read from its page again, and
+        // shown as it was while it can't be.
+        assert_eq!(Block::decode("v 2\np Một"), None);
+        assert_eq!(
+            Block::decode_older("v 2\np Một"),
+            Some(vec![Block::Paragraph("Một".into())])
+        );
+        assert_eq!(Block::decode_older("v 3\np Một"), None);
+    }
+
+    #[test]
+    fn only_a_video_object_is_a_video() {
+        let typed = |t: &str| is_video_object(&serde_json::json!({ "@type": t }));
+        assert!(typed("VideoObject"));
+        assert!(typed("http://schema.org/VideoObject"));
+        assert!(typed("schema:VideoObject"));
+        assert!(!typed("NotAVideoObject"));
+        assert!(is_video_object(
+            &serde_json::json!({ "@type": ["Thing", "VideoObject"] })
+        ));
+    }
+
+    #[test]
+    fn only_the_videos_a_pages_data_says_are_its_own_go_first() {
+        let page = |data: &str| {
+            format!(
+                r#"<html><head><script type="application/ld+json">{data}</script></head>
+                <body><article><p>{LONG}</p><p>{LONG}</p></article></body></html>"#
+            )
+        };
+        let video = r#"{"@type":"VideoObject","contentUrl":"https://v.vn/a.mp4"}"#;
+        let first = |data: &str| article_text(&page(data), "https://e.vn/a.html").remove(0);
+        let ours = Block::Video(Video {
+            url: "https://v.vn/a.mp4".into(),
+            poster: None,
+        });
+        // At the top, in its @graph, or an article's video.
+        assert_eq!(first(video), ours);
+        assert_eq!(
+            first(&format!(r#"{{"@graph":[{{"@type":"WebPage"}},{video}]}}"#)),
+            ours
+        );
+        assert_eq!(
+            first(&format!(r#"{{"@type":"NewsArticle","video":{video}}}"#)),
+            ours
+        );
+        // A list of other videos, the site's, isn't the article's.
+        let others = format!(
+            r#"{{"@type":"ItemList","itemListElement":[{{"@type":"ListItem","item":{video}}}]}}"#
+        );
+        assert!(matches!(first(&others), Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn a_name_every_stream_has_doesnt_make_two_videos_one() {
+        // `playlist` is every HLS stream's name: the page's data naming
+        // clip B says nothing of clip A's address.
+        let data = r#"{"@type":"VideoObject","contentUrl":"https://v.vn/clip-b/playlist.m3u8"}"#;
+        let page = format!(
+            r#"<html><head><script type="application/ld+json">{data}</script></head><body>
+            <article><p>{LONG}</p><video src="https://v.vn/clip-a/playlist.m3u8"></video>
+            <p>{LONG}</p></article></body></html>"#
+        );
+        let blocks = article_text(&page, "https://e.vn/a.html");
+        assert_eq!(
+            videos(&blocks)
+                .iter()
+                .map(|v| v.url.as_str())
+                .collect::<Vec<_>>(),
+            ["https://v.vn/clip-a/playlist.m3u8"]
+        );
+    }
+
+    #[test]
+    fn a_video_inside_a_player_is_that_players() {
+        let page = format!(
+            r#"<html><body><div class="detail-content"><p>{LONG}</p>
+            <div type="VideoStream" data-vid="thanhnien.mediacdn.vn/a/clip-17930073.mp4"
+              data-thumb="https://thanhnien.mediacdn.vn/a/t.jpg">
+              <video src="https://thanhnien.mediacdn.vn/a/clip-17930073.mp4"></video></div>
+            <p>{LONG}</p></div></body></html>"#
+        );
+        let blocks = article_text(&page, "https://thanhnien.vn/a.htm");
+        assert_eq!(videos(&blocks).len(), 1, "{blocks:#?}");
+    }
+
+    #[test]
+    fn a_video_that_loops_muted_is_a_moving_picture() {
+        // Tuổi Trẻ's GIFs come as videos that play on their own.
+        let page = format!(
+            r#"<html><body><div class="detail-content"><p>{LONG}</p>
+            <video autoplay muted loop playsinline poster="https://cdn2.tuoitre.vn/a.gif.png"
+              src="https://cdn2.tuoitre.vn/a.gif.mp4"></video><p>{LONG}</p></div></body></html>"#
+        );
+        let blocks = article_text(&page, "https://tuoitre.vn/a.htm");
+        assert_eq!(
+            blocks[1],
+            Block::Picture("https://cdn2.tuoitre.vn/a.gif.png".into())
+        );
+        assert!(videos(&blocks).is_empty());
     }
 }

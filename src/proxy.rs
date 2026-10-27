@@ -11,6 +11,7 @@
 //! SOCKS one) is refused at start rather than gone around. The proxy's
 //! address may hold a password, so it's never printed.
 
+use std::ffi::OsString;
 use std::sync::OnceLock;
 
 /// The variables a proxy is taken from, first set first.
@@ -36,7 +37,7 @@ static CHOSEN: OnceLock<Option<Proxy>> = OnceLock::new();
 /// Picks the proxy, once, at start. An error names the variable but never
 /// its value.
 pub fn init() -> anyhow::Result<()> {
-    let chosen = choose(|name| std::env::var(name).ok())?;
+    let chosen = choose(|name| std::env::var_os(name))?;
     let _ = CHOSEN.set(chosen);
     Ok(())
 }
@@ -46,12 +47,18 @@ pub fn get() -> Option<&'static Proxy> {
     CHOSEN.get().and_then(Option::as_ref)
 }
 
-fn choose(var: impl Fn(&str) -> Option<String>) -> anyhow::Result<Option<Proxy>> {
-    let Some((from, value)) = NAMES
-        .iter()
-        .find_map(|&name| Some((name, var(name).filter(|v| !v.trim().is_empty())?)))
-    else {
+fn choose(var: impl Fn(&str) -> Option<OsString>) -> anyhow::Result<Option<Proxy>> {
+    // One that isn't text is set all the same: refused below, never read as
+    // none, which would send everything direct.
+    let Some((from, value)) = NAMES.iter().find_map(|&name| {
+        let value = var(name)?;
+        let set = value.to_str().is_none_or(|v| !v.trim().is_empty());
+        set.then_some((name, value))
+    }) else {
         return Ok(None);
+    };
+    let Some(value) = value.to_str() else {
+        anyhow::bail!("{from} doesn't hold a proxy address tuinews can read");
     };
     let value = value.trim();
     // `host:port` means an http proxy, as curl reads it.
@@ -93,11 +100,11 @@ pub fn shown() -> String {
 mod tests {
     use super::*;
 
-    fn env<'a>(vars: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'a {
+    fn env<'a>(vars: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
         move |name| {
             vars.iter()
                 .find(|(k, _)| *k == name)
-                .map(|(_, v)| v.to_string())
+                .map(|(_, v)| OsString::from(v))
         }
     }
 
@@ -133,5 +140,16 @@ mod tests {
         );
         let bad = choose(env(&[("https_proxy", "http://")])).unwrap_err();
         assert!(bad.to_string().contains("https_proxy"), "{bad}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_proxy_that_isnt_text_is_refused_not_taken_for_none() {
+        use std::os::unix::ffi::OsStringExt;
+        let garbled = |name: &str| {
+            (name == "https_proxy").then(|| OsString::from_vec(b"http://pr\xffoxy:3128".to_vec()))
+        };
+        let error = choose(garbled).unwrap_err().to_string();
+        assert!(error.contains("https_proxy"), "{error}");
     }
 }

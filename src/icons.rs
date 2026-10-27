@@ -46,6 +46,9 @@ pub struct Icons {
     pub failed: &'static str,
     pub refresh: &'static str,
     pub link: &'static str,
+    /// An article's video, and the one playing; paused.
+    pub play: &'static str,
+    pub pause: &'static str,
 }
 
 /// Font Awesome's, as every Nerd Font has them.
@@ -62,6 +65,8 @@ pub const NERD: Icons = Icons {
     failed: "\u{f071}",
     refresh: "\u{f021}",
     link: "\u{f0c1}",
+    play: "\u{f04b}",
+    pause: "\u{f04c}",
 };
 
 pub const PLAIN: Icons = Icons {
@@ -77,6 +82,8 @@ pub const PLAIN: Icons = Icons {
     failed: "!",
     refresh: "↻",
     link: "↗",
+    play: "▶",
+    pause: "⏸",
 };
 
 impl Icons {
@@ -148,6 +155,8 @@ mod tests {
                 icons.failed,
                 icons.refresh,
                 icons.link,
+                icons.play,
+                icons.pause,
             ] {
                 assert_eq!(icon.width(), 1, "{icon:?}");
             }
