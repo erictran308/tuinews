@@ -11,15 +11,18 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use image::DynamicImage;
 use image::imageops::FilterType;
-use ratatui::layout::Size;
-use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Rect, Size};
+use ratatui_image::picker::cap_parser::Parser;
+use ratatui_image::picker::{Capability, Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
+use ratatui_image::protocol::kitty::Kitty;
 use ratatui_image::sliced::SlicedProtocol;
 use ratatui_image::{FontSize, Resize};
 use tokio::sync::Semaphore;
@@ -38,6 +41,13 @@ const MAX_DOWNLOADS: usize = 6;
 const MAX_READY: usize = 300;
 /// Pictures of articles' text kept, the same way.
 const MAX_SLICED: usize = 80;
+/// What the pictures kept may take in a terminal speaking kitty's protocol,
+/// in bytes of pixels. Such a terminal keeps every picture it's sent until
+/// told to delete it, and past its quota (320 MB in Ghostty and kitty) it
+/// drops the ones sent first: the cards of Home behind the reader, which
+/// then stay blank, as a picture is sent only with its first drawing. Half
+/// the quota leaves room for what's on screen past it.
+const KITTY_BUDGET: usize = 160_000_000;
 /// A picture still building after this long counts as failed.
 const BUILD_TIMEOUT: Duration = Duration::from_secs(40);
 
@@ -62,13 +72,64 @@ pub struct Key {
 /// What building a picture made.
 enum Built {
     /// A card's or the reader's own picture, cropped to fill its box.
-    Whole(Protocol),
+    Whole(Protocol, Option<KittyImage>),
     /// A picture in an article's text, in rows.
-    Sliced(SlicedProtocol),
+    Sliced(SlicedProtocol, Option<KittyImage>),
     /// A picture in an article's text whose shape (its size in pixels) is
     /// far from its box's, laid out before its shape was known: it's asked
     /// for again at its own.
     Shape,
+}
+
+/// Numbers of kitty pictures dropped since the terminal was last told; see
+/// [`Images::deletions`].
+type Dropped = Arc<Mutex<Vec<u32>>>;
+
+/// A picture made for kitty's protocol: the number the terminal knows it
+/// by and the bytes it takes there once it's been sent, with its first
+/// drawing. Dropping one sent, wherever that happens, adds its number to
+/// those the terminal is told to delete.
+struct KittyImage {
+    id: u32,
+    bytes: usize,
+    sent: bool,
+    dropped: Dropped,
+}
+
+impl Drop for KittyImage {
+    fn drop(&mut self) {
+        if self.sent {
+            self.dropped
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(self.id);
+        }
+    }
+}
+
+/// A picture kept, encoded for the terminal.
+struct Encoded<T> {
+    image: T,
+    /// The frame it was last drawn (or asked for) in.
+    used: u64,
+    /// Deletes it from the terminal once it's dropped.
+    kitty: Option<KittyImage>,
+}
+
+impl<T> Encoded<T> {
+    /// It's in the terminal: a kitty picture drawn once.
+    fn sent(&self) -> bool {
+        self.kitty.as_ref().is_some_and(|k| k.sent)
+    }
+
+    /// What it takes in a terminal speaking kitty's protocol: nothing until
+    /// it's sent.
+    fn sent_bytes(&self) -> usize {
+        match &self.kitty {
+            Some(kitty) if self.sent() => kitty.bytes,
+            _ => 0,
+        }
+    }
 }
 
 /// A picture finished encoding (or failed) on a background thread, with
@@ -372,9 +433,10 @@ pub struct Images {
     /// At most `MAX_BUILDING` pictures decode at once, however many are
     /// downloading.
     decoding: Arc<Semaphore>,
-    /// Encoded pictures, with the frame each was last drawn in.
-    ready: HashMap<Key, (Protocol, u64)>,
-    sliced: HashMap<Key, (SlicedProtocol, u64)>,
+    /// Encoded pictures: cards' and the reader's own, and those of
+    /// articles' text, in rows.
+    ready: HashMap<Key, Encoded<Protocol>>,
+    sliced: HashMap<Key, Encoded<SlicedProtocol>>,
     /// Pictures' sizes in pixels, once decoded: the reader lays out a
     /// picture in its text at its own shape.
     shapes: HashMap<Subject, (u32, u32)>,
@@ -393,6 +455,15 @@ pub struct Images {
     /// How many pictures the last frame asked for that weren't ready and
     /// hadn't failed; `None` before a frame.
     missing: Option<usize>,
+    /// The number the last picture built for kitty's protocol was given.
+    kitty_id: u32,
+    /// Pictures dropped since the terminal was last told.
+    dropped: Dropped,
+    /// The code that sends the pictures the last frame drew for the first
+    /// time, for after it ([`place`](Self::place)).
+    transmits: String,
+    /// See [`KITTY_BUDGET`]; smaller in tests.
+    kitty_budget: usize,
 }
 
 /// A picture drawn in a frame: the area it was made for, and the part of
@@ -432,6 +503,10 @@ impl Images {
             placed: Vec::new(),
             holding: false,
             missing: None,
+            kitty_id: kitty_id_base(),
+            dropped: Dropped::default(),
+            transmits: String::new(),
+            kitty_budget: KITTY_BUDGET,
         }
     }
 
@@ -441,18 +516,41 @@ impl Images {
         self.offline = true;
     }
 
-    /// Notes where a picture was drawn this frame.
-    pub fn place(
-        &mut self,
-        subject: &Subject,
-        area: ratatui::layout::Rect,
-        shown: ratatui::layout::Rect,
-    ) {
+    /// Notes where a picture was drawn this frame, `key`'s, in `buf`. A
+    /// kitty picture's first drawing puts the code that sends it in the
+    /// first cell drawn, the top left of what's `shown`, ahead of its
+    /// placeholder: it's taken out of there, to be sent after the frame
+    /// ([`take_transmits`](Self::take_transmits)). Whatever the frame draws
+    /// over that cell later (the reader, a popup, the corner video's box)
+    /// then covers only the placeholder, and the picture still comes.
+    pub fn place(&mut self, key: &Key, area: Rect, shown: Rect, buf: &mut Buffer) {
+        if self.picker.protocol_type() == ProtocolType::Kitty
+            && let Some(cell) = buf.cell_mut(shown.as_position())
+            && take_transmit(cell, &mut self.transmits)
+            && let Some(kitty) = self.kitty_of(key)
+        {
+            kitty.sent = true;
+        }
         self.placed.push(Placement {
-            subject: subject.clone(),
+            subject: key.subject.clone(),
             area,
             shown,
         });
+    }
+
+    /// The code that sends the pictures the last frame drew for the first
+    /// time, taken out of their cells ([`place`](Self::place)); empty when
+    /// there are none. Written right after the frame (`App::run`).
+    pub fn take_transmits(&mut self) -> String {
+        std::mem::take(&mut self.transmits)
+    }
+
+    /// `key`'s picture's kitty image, in whichever list holds it.
+    fn kitty_of(&mut self, key: &Key) -> Option<&mut KittyImage> {
+        match key.subject {
+            Subject::Article(_) => self.ready.get_mut(key)?.kitty.as_mut(),
+            Subject::Inline(_) => self.sliced.get_mut(key)?.kitty.as_mut(),
+        }
     }
 
     /// Draws with `protocol` from now on: for a test of what a terminal with
@@ -462,7 +560,7 @@ impl Images {
         self.picker.set_protocol_type(protocol);
     }
 
-    /// Makes every card picture the last frame wanted ready at once, from
+    /// Makes every picture the last frame wanted ready at once, from
     /// `photo`, on this thread: for drawing a frame with pictures in a test.
     #[cfg(test)]
     pub fn build_wanted_now(&mut self, photo: &DynamicImage) {
@@ -472,10 +570,9 @@ impl Images {
                 u32::from(key.cols) * u32::from(font.width),
                 u32::from(key.rows) * u32::from(font.height),
             );
-            if matches!(key.subject, Subject::Article(_))
-                && let Ok(image) = encode(&self.picker, &key, photo, width, height)
-            {
-                self.ready.insert(key, (image, self.frame));
+            let kitty = self.next_kitty();
+            if let Ok(built) = encode(&self.picker, &key, photo, width, height, kitty) {
+                self.keep(key, built);
             }
         }
     }
@@ -503,34 +600,34 @@ impl Images {
     /// The picture ready to draw, if it is; else it's fetched after the
     /// frame, from `url`.
     pub fn get(&mut self, key: &Key, url: &str) -> Option<&Protocol> {
-        if !self.ready.contains_key(key) {
-            self.want(key, url);
-            return None;
-        }
-        let frame = self.frame;
-        let (image, used) = self.ready.get_mut(key)?;
-        *used = frame;
-        // Kept for when they can be drawn.
-        if self.holding {
-            return None;
-        }
-        Some(image)
+        self.ready_to_draw(|images| &mut images.ready, key, url)
     }
 
     /// A picture of an article's text, ready to draw in rows, if it is;
     /// else it's fetched after the frame, from `url`.
     pub fn get_sliced(&mut self, key: &Key, url: &str) -> Option<&SlicedProtocol> {
-        if !self.sliced.contains_key(key) {
+        self.ready_to_draw(|images| &mut images.sliced, key, url)
+    }
+
+    /// [`get`](Self::get) from the pictures `kept` gives.
+    fn ready_to_draw<T>(
+        &mut self,
+        kept: impl Fn(&mut Self) -> &mut HashMap<Key, Encoded<T>>,
+        key: &Key,
+        url: &str,
+    ) -> Option<&T> {
+        if !kept(self).contains_key(key) {
             self.want(key, url);
             return None;
         }
+        // Sixel and iTerm2 pictures would be painted over the splash; a
+        // kitty one is sent apart from the frame, its placeholders under it.
+        let held = self.holding && self.paints_over();
         let frame = self.frame;
-        let (image, used) = self.sliced.get_mut(key)?;
-        *used = frame;
-        if self.holding {
-            return None;
-        }
-        Some(image)
+        let picture = kept(self).get_mut(key)?;
+        picture.used = frame;
+        // Kept for when they can be drawn.
+        (!held).then_some(&picture.image)
     }
 
     /// The frame asked for a picture that isn't ready: it's fetched after it.
@@ -542,9 +639,8 @@ impl Images {
     }
 
     /// While the splash screen covers the frame (`ui::splash`): pictures
-    /// are fetched and made ready as usual, but not drawn, as a kitty
-    /// picture is sent only with its first drawing, and the splash would
-    /// cover that.
+    /// are fetched and made ready as usual, but sixel and iTerm2 ones
+    /// aren't drawn, as they would be painted over the splash.
     pub fn hold(&mut self, holding: bool) {
         self.holding = holding;
     }
@@ -574,6 +670,7 @@ impl Images {
     /// Starts downloads and encodes for what the last frame wanted.
     pub fn fetch(&mut self) {
         self.frame += 1;
+        self.keep_within_budget();
         let failed = &mut self.failed;
         self.building.retain(|key, started| {
             let alive = started.elapsed() < BUILD_TIMEOUT;
@@ -598,11 +695,12 @@ impl Images {
                 continue;
             }
             self.building.insert(key.clone(), Instant::now());
-            self.spawn(key, url);
+            let kitty = self.next_kitty();
+            self.spawn(key, url, kitty);
         }
     }
 
-    fn spawn(&self, key: Key, url: String) {
+    fn spawn(&self, key: Key, url: String, kitty: Option<(u32, Dropped)>) {
         let picker = self.picker.clone();
         let tx = self.tx.clone();
         let http = self.http.clone();
@@ -635,7 +733,7 @@ impl Images {
             let data = Arc::new(data);
             let bytes = data.clone();
             let decoded = tokio::task::spawn_blocking(move || {
-                contained(|| build(&picker, font, &build_key, &bytes, laid_at_shape))
+                contained(|| build(&picker, font, &build_key, &bytes, laid_at_shape, kitty))
             })
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("the picture couldn't be decoded")));
@@ -666,20 +764,113 @@ impl Images {
             self.shapes.insert(event.key.subject.clone(), shape);
         }
         match event.result {
-            Ok(Built::Whole(image)) => {
-                evict(&mut self.ready, MAX_READY);
-                self.ready.insert(event.key, (image, self.frame));
-            }
-            Ok(Built::Sliced(image)) => {
-                evict(&mut self.sliced, MAX_SLICED);
-                self.sliced.insert(event.key, (image, self.frame));
-            }
-            // Asked for again, at its shape, by the next frame.
-            Ok(Built::Shape) => {}
+            Ok(built) => self.keep(event.key, built),
             Err(_) => {
                 self.failed.insert(event.key);
             }
         }
+    }
+
+    /// Keeps a picture built, within [`MAX_READY`] or [`MAX_SLICED`].
+    fn keep(&mut self, key: Key, built: Built) {
+        match built {
+            Built::Whole(image, kitty) => {
+                self.keep_in(|images| &mut images.ready, MAX_READY, key, image, kitty);
+            }
+            Built::Sliced(image, kitty) => {
+                self.keep_in(|images| &mut images.sliced, MAX_SLICED, key, image, kitty);
+            }
+            // Asked for again, at its shape, by the next frame.
+            Built::Shape => {}
+        }
+    }
+
+    /// Keeps `image` among the pictures `kept` gives, at most `max` of them.
+    /// One it replaces counts no more.
+    fn keep_in<T>(
+        &mut self,
+        kept: impl Fn(&mut Self) -> &mut HashMap<Key, Encoded<T>>,
+        max: usize,
+        key: Key,
+        image: T,
+        kitty: Option<KittyImage>,
+    ) {
+        kept(self).remove(&key);
+        evict(kept(self), max);
+        let used = self.frame;
+        kept(self).insert(key, Encoded { image, used, kitty });
+    }
+
+    /// Keeps what the pictures sent take in a terminal speaking kitty's
+    /// protocol within [`KITTY_BUDGET`]: after each frame, once the
+    /// pictures it drew are sent (one not sent takes nothing there). The
+    /// pictures of articles' text go first, those drawn longest ago first:
+    /// each takes several MB, against a card's one or two, and the reader
+    /// shows a few at a time, while the cards behind it are what closing it
+    /// shows. Never one the frame drew or asked for, which the next would
+    /// build again, pushing out another, frame after frame: those may go
+    /// past it.
+    fn keep_within_budget(&mut self) {
+        if self.picker.protocol_type() != ProtocolType::Kitty {
+            return;
+        }
+        let mut taken = self.sent_bytes();
+        if taken <= self.kitty_budget {
+            return;
+        }
+        let in_use = self.frame.saturating_sub(1);
+        // In the order they go: the text's (`false`) first.
+        let mut order: Vec<(bool, u64, Key)> = droppable(&self.sliced, in_use)
+            .map(|(used, key)| (false, used, key))
+            .chain(droppable(&self.ready, in_use).map(|(used, key)| (true, used, key)))
+            .collect();
+        order.sort_unstable_by_key(|&(whole, used, _)| (whole, used));
+        for (whole, _, key) in order {
+            if taken <= self.kitty_budget {
+                break;
+            }
+            let freed = if whole {
+                self.ready.remove(&key).map(|p| p.sent_bytes())
+            } else {
+                self.sliced.remove(&key).map(|p| p.sent_bytes())
+            };
+            taken -= freed.unwrap_or(0);
+        }
+    }
+
+    /// What the pictures sent take in a terminal speaking kitty's protocol.
+    fn sent_bytes(&self) -> usize {
+        let whole = self.ready.values().map(Encoded::sent_bytes);
+        let sliced = self.sliced.values().map(Encoded::sent_bytes);
+        whole.chain(sliced).sum()
+    }
+
+    /// A number for the next picture built with kitty's protocol, and where
+    /// it goes once that picture is dropped.
+    fn next_kitty(&mut self) -> Option<(u32, Dropped)> {
+        (self.picker.protocol_type() == ProtocolType::Kitty).then(|| {
+            // Never 0, which kitty's protocol takes as no number.
+            self.kitty_id = self.kitty_id.wrapping_add(1).max(1);
+            (self.kitty_id, self.dropped.clone())
+        })
+    }
+
+    /// Drops every picture kept, as tuinews quits: a terminal speaking
+    /// kitty's protocol would keep them after it's gone.
+    pub fn drop_all(&mut self) {
+        self.ready.clear();
+        self.sliced.clear();
+    }
+
+    /// The code that has a terminal speaking kitty's protocol delete the
+    /// pictures dropped since it was last told, wherever that happened
+    /// (`KittyImage`), freeing what they took there; empty when there are
+    /// none. Written before each frame, ahead of any picture it sends, and
+    /// on quitting (`App::send_deletions`).
+    pub fn deletions(&self) -> String {
+        let ids = std::mem::take(&mut *self.dropped.lock().unwrap_or_else(PoisonError::into_inner));
+        let tmux = self.picker.tmux_detected();
+        ids.into_iter().map(|id| kitty_delete(id, tmux)).collect()
     }
 
     /// Forgets failures, so a refresh tries those pictures again.
@@ -688,17 +879,28 @@ impl Images {
     }
 }
 
-/// Makes room for one more in `ready`, at most `max`: the one drawn longest
+/// Makes room for one more in `kept`, at most `max`: the one drawn longest
 /// ago goes.
-fn evict<T>(ready: &mut HashMap<Key, (T, u64)>, max: usize) {
-    if ready.len() >= max
-        && let Some(oldest) = ready
+fn evict<T>(kept: &mut HashMap<Key, Encoded<T>>, max: usize) {
+    if kept.len() >= max
+        && let Some(key) = kept
             .iter()
-            .min_by_key(|(_, (_, used))| *used)
-            .map(|(k, _)| k.clone())
+            .min_by_key(|(_, p)| p.used)
+            .map(|(key, _)| key.clone())
     {
-        ready.remove(&oldest);
+        kept.remove(&key);
     }
+}
+
+/// The pictures in `kept` that may go to make room in the terminal: sent,
+/// and last drawn before frame `in_use`; with when each was.
+fn droppable<T>(
+    kept: &HashMap<Key, Encoded<T>>,
+    in_use: u64,
+) -> impl Iterator<Item = (u64, Key)> + '_ {
+    kept.iter()
+        .filter(move |(_, p)| p.sent() && p.used < in_use)
+        .map(|(key, p)| (p.used, key.clone()))
 }
 
 /// Decodes `data` and encodes it for the terminal at `key`'s size; and its
@@ -710,6 +912,7 @@ fn build(
     key: &Key,
     data: &[u8],
     laid_at_shape: bool,
+    kitty: Option<(u32, Dropped)>,
 ) -> Result<(Built, (u32, u32))> {
     let photo = decode(data)?;
     let shape = (photo.width(), photo.height());
@@ -718,21 +921,14 @@ fn build(
         u32::from(key.rows) * u32::from(font.height),
     );
     let built = match key.subject {
-        Subject::Article(_) => Built::Whole(encode(picker, key, &photo, width, height)?),
+        Subject::Article(_) => encode(picker, key, &photo, width, height, kitty)?,
         Subject::Inline(_) => {
             let wanted = width as f32 / height.max(1) as f32;
             let own = shape.0 as f32 / shape.1.max(1) as f32;
             if !laid_at_shape && (wanted / own - 1.0).abs() > SHAPE_SLACK {
                 Built::Shape
             } else {
-                let filled = fill(&photo, width, height);
-                let size = Size::new(key.cols, key.rows);
-                Built::Sliced(SlicedProtocol::new_with_resize(
-                    picker,
-                    filled,
-                    size,
-                    Resize::Fit(None),
-                )?)
+                encode(picker, key, &photo, width, height, kitty)?
             }
         }
     };
@@ -740,16 +936,97 @@ fn build(
 }
 
 /// Encodes a decoded picture for the terminal at `key`'s size, cropped to
-/// fill it (`width`×`height` pixels).
+/// fill it (`width`×`height` pixels): whole for an article's own, in rows
+/// for one of its text's. With kitty's protocol it's sent as the picture
+/// numbered by `kitty`, picked here rather than at random by the picker, so
+/// it can be deleted from the terminal once it's dropped.
 fn encode(
     picker: &Picker,
     key: &Key,
     photo: &DynamicImage,
     width: u32,
     height: u32,
-) -> Result<Protocol> {
+    kitty: Option<(u32, Dropped)>,
+) -> Result<Built> {
     let image = fill(photo, width, height);
-    Ok(picker.new_protocol(image, Size::new(key.cols, key.rows), Resize::Fit(None))?)
+    let size = Size::new(key.cols, key.rows);
+    let sliced = matches!(key.subject, Subject::Inline(_));
+    // The picker's `new_protocol` with `Resize::Fit` uses a picture as it
+    // is when its own size in cells is its box's and a side is whole
+    // cells, as `fill` makes it: then the same `Kitty` is made here, but
+    // numbered by tuinews. `SlicedProtocol::new_with_resize` makes its
+    // kitty pictures with `new_protocol` too.
+    let font = picker.font_size();
+    let as_is = Resize::natural_size(&image, font) == size
+        && (image.width() == u32::from(size.width) * u32::from(font.width)
+            || image.height() == u32::from(size.height) * u32::from(font.height));
+    if let Some((id, dropped)) = kitty
+        && as_is
+    {
+        let bytes = image.width() as usize * image.height() as usize * 4;
+        let compress = picker
+            .capabilities()
+            .contains(&Capability::KittyCompression);
+        let image = Kitty::new(image, size, id, picker.tmux_detected(), compress)?;
+        let kitty = Some(KittyImage {
+            id,
+            bytes,
+            sent: false,
+            dropped,
+        });
+        return Ok(if sliced {
+            Built::Sliced(SlicedProtocol::Kitty(image), kitty)
+        } else {
+            Built::Whole(Protocol::Kitty(image), kitty)
+        });
+    }
+    // Anything else as the picker makes it, numbered at random: tuinews
+    // can't name it to delete it.
+    Ok(if sliced {
+        let image = SlicedProtocol::new_with_resize(picker, image, size, Resize::Fit(None))?;
+        Built::Sliced(image, None)
+    } else {
+        Built::Whole(picker.new_protocol(image, size, Resize::Fit(None))?, None)
+    })
+}
+
+/// Where numbers for kitty's pictures start: at random, as the picker's
+/// own are, since every program drawing in the terminal's window shares
+/// them (tuinews and tuitube in panes of one tmux), and one's deletions
+/// mustn't take the other's pictures.
+fn kitty_id_base() -> u32 {
+    use std::hash::{BuildHasher, RandomState};
+    RandomState::new().hash_one(std::process::id()) as u32
+}
+
+/// The code that has the terminal delete picture number `id` of kitty's
+/// protocol. `I` deletes the picture itself, not only where it's placed;
+/// `q=2` asks for no answer, which would come in as keys.
+fn kitty_delete(id: u32, tmux: bool) -> String {
+    let (start, escape, end) = Parser::tmux_start_escape_end(tmux);
+    format!("{start}{escape}_Ga=d,d=I,i={id},q=2{escape}\\{end}")
+}
+
+/// The character kitty's protocol draws a picture's cells with, ratatui-image
+/// and the terminal both.
+const PLACEHOLDER: char = '\u{10EEEE}';
+
+/// Takes the code that sends a kitty picture out of `cell`, the first one a
+/// picture's first drawing draws, where ratatui-image puts it before the
+/// placeholder (wrapped for tmux, if need be), onto `out`, and leaves the
+/// placeholder. Whether there was one.
+fn take_transmit(cell: &mut ratatui::buffer::Cell, out: &mut String) -> bool {
+    let symbol = cell.symbol();
+    if !symbol.starts_with('\x1b') {
+        return false;
+    }
+    let Some(at) = symbol.rfind(PLACEHOLDER) else {
+        return false;
+    };
+    out.push_str(&symbol[..at]);
+    let placeholder = symbol[at..].to_string();
+    cell.set_symbol(&placeholder);
+    true
 }
 
 /// The cache file for a picture: named by its checked id only.
@@ -841,6 +1118,10 @@ async fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::Widget;
+    use ratatui_image::Image;
+    use ratatui_image::sliced::{SignedPosition, SlicedImage};
 
     fn png(width: u32, height: u32) -> Vec<u8> {
         let mut data = std::io::Cursor::new(Vec::new());
@@ -1005,7 +1286,8 @@ mod tests {
             cols: 4,
             rows: 2,
         };
-        assert!(images.get(&key, "http://192.168.1.1/x.jpg").is_none());
+        let url = "http://192.168.1.1/x.jpg";
+        assert!(images.get(&key, url).is_none());
         images.fetch();
         assert!(images.is_broken(&key));
     }
@@ -1015,6 +1297,8 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut images = Images::new(Picker::halfblocks(), tx, crate::feed::client(), None);
         images.go_offline();
+        // Sixel's: painted over anything drawn after, as the splash is.
+        images.set_protocol(ProtocolType::Sixel);
         let key = Key {
             subject: Subject::Article(ArticleId::of("https://e.vn/a")),
             cols: 4,
@@ -1032,6 +1316,7 @@ mod tests {
             &key,
             &png(64, 36),
             false,
+            None,
         )
         .unwrap();
         images.on_built(ImageEvent {
@@ -1044,6 +1329,11 @@ mod tests {
         assert_eq!(images.missing(), Some(0), "but in");
         images.hold(false);
         assert!(images.get(&key, url).is_some());
+        // Kitty's are sent apart from the frame, so they're drawn under it.
+        images.set_protocol(ProtocolType::Kitty);
+        images.hold(true);
+        assert!(images.get(&key, url).is_some(), "kitty's aren't held");
+        images.hold(false);
 
         // One that can't come isn't waited for.
         let broken = Key {
@@ -1055,5 +1345,252 @@ mod tests {
         images.new_frame();
         images.get(&broken, url);
         assert_eq!(images.missing(), Some(0));
+    }
+
+    /// Pictures for a terminal speaking kitty's protocol, numbered from 1.
+    fn kitty() -> Images {
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = Images::new(picker, tx, crate::feed::client(), None);
+        images.go_offline();
+        images.kitty_id = 0;
+        images
+    }
+
+    /// A card's picture: 4 × 2 cells of 10 × 20 px, 40 × 40.
+    fn card(n: u8) -> Key {
+        Key {
+            subject: Subject::Article(ArticleId::of(&format!("https://e.vn/{n}"))),
+            cols: 4,
+            rows: 2,
+        }
+    }
+
+    /// A picture in an article's text: 8 × 4 cells, 80 × 80 px.
+    fn inline(n: u8) -> Key {
+        Key {
+            subject: Subject::Inline(ArticleId::of(&format!("https://e.vn/{n}.jpg"))),
+            cols: 8,
+            rows: 4,
+        }
+    }
+
+    /// Where `key`'s picture goes: at the top left.
+    fn at(key: &Key) -> Rect {
+        Rect::new(0, 0, key.cols, key.rows)
+    }
+
+    /// Builds `key`'s picture and keeps it, as one that came would be.
+    fn put(images: &mut Images, key: &Key) {
+        let kitty = images.next_kitty();
+        let font = images.font_size();
+        let (built, _) = build(&images.picker, font, key, &png(40, 40), true, kitty).unwrap();
+        images.keep(key.clone(), built);
+    }
+
+    /// Draws `key`'s picture as a frame does, if it's ready: the frame.
+    fn draw(images: &mut Images, key: &Key) -> Option<Buffer> {
+        let area = at(key);
+        let mut buf = Buffer::empty(area);
+        let drawn = match key.subject {
+            Subject::Article(_) => images
+                .get(key, URL)
+                .map(|image| Image::new(image).render(area, &mut buf)),
+            Subject::Inline(_) => images
+                .get_sliced(key, URL)
+                .map(|image| SlicedImage::new(image, TOP_LEFT).render(area, &mut buf)),
+        };
+        drawn?;
+        images.place(key, area, area, &mut buf);
+        Some(buf)
+    }
+
+    const URL: &str = "https://e.vn/a.jpg";
+    const TOP_LEFT: SignedPosition = SignedPosition { x: 0, y: 0 };
+
+    #[test]
+    fn a_kitty_picture_is_the_one_the_picker_would_make_but_numbered_by_tuinews() {
+        let mut images = kitty();
+        let picker = images.picker.clone();
+        let photo = decode(&png(64, 36)).unwrap();
+        // The code in its first cell that sends it, without its number.
+        let code = |buf: &Buffer| {
+            let first = buf[(0, 0)].symbol();
+            let code = &first[..first.find('\u{10EEEE}').unwrap()];
+            let at = code.find("i=").unwrap();
+            let end = at + code[at..].find(',').unwrap();
+            format!("{}{}", &code[..at], &code[end..])
+        };
+        for key in [card(1), inline(1)] {
+            let (width, height) = (u32::from(key.cols) * 10, u32::from(key.rows) * 20);
+            let size = Size::new(key.cols, key.rows);
+            let area = at(&key);
+            let (mut ours, mut theirs) = (Buffer::empty(area), Buffer::empty(area));
+            let filled = fill(&photo, width, height);
+            let built = encode(&picker, &key, &photo, width, height, images.next_kitty());
+            let number = format!("i={},", images.kitty_id);
+            let sizes = match built.unwrap() {
+                Built::Whole(image, Some(_)) => {
+                    let made = picker
+                        .new_protocol(filled, size, Resize::Fit(None))
+                        .unwrap();
+                    Image::new(&image).render(area, &mut ours);
+                    Image::new(&made).render(area, &mut theirs);
+                    (image.size(), made.size())
+                }
+                Built::Sliced(image, Some(_)) => {
+                    let made =
+                        SlicedProtocol::new_with_resize(&picker, filled, size, Resize::Fit(None))
+                            .unwrap();
+                    SlicedImage::new(&image, TOP_LEFT).render(area, &mut ours);
+                    SlicedImage::new(&made, TOP_LEFT).render(area, &mut theirs);
+                    (image.size(), made.size())
+                }
+                _ => panic!("made by tuinews, to be deleted"),
+            };
+            assert_eq!(sizes.0, sizes.1, "{key:?}");
+            assert_eq!(code(&ours), code(&theirs), "{key:?}");
+            assert!(
+                ours[(0, 0)].symbol().contains(&number),
+                "numbered by tuinews"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_kitty_picture_is_sent_after_the_frame_and_not_from_its_first_cell() {
+        let mut images = kitty();
+        for (n, key) in [card(1), inline(1)].iter().enumerate() {
+            put(&mut images, key);
+            let mut frame = draw(&mut images, key).unwrap();
+            let first = frame[(0, 0)].symbol();
+            assert!(first.starts_with(PLACEHOLDER), "{first:?}");
+            assert!(!first.contains('\x1b'), "the code is out of it: {first:?}");
+            // Whatever the frame draws there later (the reader, a popup, the
+            // corner video's box) covers only the placeholder.
+            frame[(0, 0)].set_symbol("─");
+            let code = images.take_transmits();
+            assert_eq!(code.matches("a=T").count(), 1, "{key:?}");
+            assert!(code.contains(&format!("i={},a=T", n + 1)), "{code:?}");
+            assert_eq!(images.take_transmits(), "", "queued once");
+            // The next frame draws only its placeholders.
+            draw(&mut images, key).unwrap();
+            assert_eq!(images.take_transmits(), "", "a second frame sends nothing");
+        }
+    }
+
+    #[test]
+    fn a_kitty_terminal_is_told_to_delete_the_pictures_it_was_sent_by_their_numbers() {
+        let mut images = kitty();
+        let tmux = images.picker.tmux_detected();
+        let delete = |id| kitty_delete(id, tmux);
+        put(&mut images, &card(1));
+        draw(&mut images, &card(1));
+        assert!(images.take_transmits().contains("i=1,a=T"), "sent as 1");
+        assert_eq!(images.deletions(), "", "nothing dropped yet");
+
+        // Built again, it replaces the one sent.
+        put(&mut images, &card(1));
+        assert_eq!(images.deletions(), delete(1));
+        assert_eq!(images.deletions(), "", "told once");
+        // One never drawn was never sent: there's nothing to delete.
+        put(&mut images, &card(1));
+        assert_eq!(images.deletions(), "", "never sent");
+        draw(&mut images, &card(1));
+
+        // Past the most kept, the one drawn longest ago goes.
+        for n in 0..MAX_SLICED as u8 {
+            images.frame += 1;
+            put(&mut images, &inline(n));
+            draw(&mut images, &inline(n));
+        }
+        assert_eq!(images.deletions(), "", "all kept");
+        images.frame += 1;
+        put(&mut images, &inline(200));
+        assert_eq!(images.deletions(), delete(4), "the first of them");
+
+        // Quitting drops the rest, and those sent are deleted.
+        images.drop_all();
+        let code = images.deletions();
+        assert_eq!(code.matches("a=d").count(), MAX_SLICED, "{code}");
+        assert!(code.contains(&delete(3)), "the card");
+        assert!(!code.contains(&delete(84)), "the last, never drawn");
+    }
+
+    #[test]
+    fn after_each_frame_the_pictures_sent_go_back_under_the_quota_but_not_those_on_screen() {
+        let mut images = kitty();
+        let tmux = images.picker.tmux_detected();
+        images.kitty_budget = 2 * 40 * 40 * 4;
+        // A frame draws three cards: all on screen, past the quota.
+        for n in 1..=3 {
+            put(&mut images, &card(n));
+            draw(&mut images, &card(n));
+        }
+        images.fetch();
+        assert_eq!(images.ready.len(), 3);
+        assert_eq!(images.deletions(), "");
+
+        // The next shows the first and the third.
+        draw(&mut images, &card(1));
+        draw(&mut images, &card(3));
+        images.fetch();
+        assert!(!images.ready.contains_key(&card(2)));
+        assert_eq!(images.deletions(), kitty_delete(2, tmux));
+
+        // One not sent yet (say, just come) takes nothing in the terminal.
+        put(&mut images, &card(4));
+        draw(&mut images, &card(1));
+        draw(&mut images, &card(3));
+        images.fetch();
+        assert_eq!(images.ready.len(), 3);
+        assert_eq!(images.deletions(), "");
+    }
+
+    #[test]
+    fn the_pictures_of_articles_go_before_the_cards_behind_the_reader() {
+        let mut images = kitty();
+        // A card and one picture of an article's text.
+        images.kitty_budget = 40 * 40 * 4 + 80 * 80 * 4;
+        // Drawn before the reader opened.
+        put(&mut images, &card(1));
+        draw(&mut images, &card(1));
+        images.frame = 2;
+        put(&mut images, &inline(1));
+        draw(&mut images, &inline(1));
+        // The next article's.
+        images.frame = 4;
+        put(&mut images, &inline(2));
+        draw(&mut images, &inline(2));
+        images.fetch();
+        assert!(
+            images.ready.contains_key(&card(1)),
+            "though drawn longest ago"
+        );
+        assert!(!images.sliced.contains_key(&inline(1)));
+        assert!(images.sliced.contains_key(&inline(2)));
+    }
+
+    #[test]
+    fn inside_tmux_the_code_that_deletes_pictures_goes_through_it() {
+        assert_eq!(kitty_delete(1, false), "\x1b_Ga=d,d=I,i=1,q=2\x1b\\");
+        assert_eq!(
+            kitty_delete(1, true),
+            "\x1bPtmux;\x1b\x1b_Ga=d,d=I,i=1,q=2\x1b\x1b\\\x1b\\"
+        );
+    }
+
+    #[test]
+    fn terminals_that_keep_no_pictures_are_told_nothing() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = Images::new(Picker::halfblocks(), tx, crate::feed::client(), None);
+        for key in [card(1), card(1), inline(1)] {
+            put(&mut images, &key);
+            draw(&mut images, &key);
+        }
+        images.drop_all();
+        assert_eq!(images.take_transmits(), "");
+        assert_eq!(images.deletions(), "");
     }
 }

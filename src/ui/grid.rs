@@ -267,7 +267,7 @@ pub(super) fn picture(
             None => false,
         });
     if drawn {
-        app.images.place(&key.subject, area, shown);
+        app.images.place(&key, area, shown, frame.buffer_mut());
         return true;
     }
     frame.render_widget(Block::new().style(Style::new().bg(c.selected)), shown);

@@ -402,7 +402,7 @@ mod tests {
     use crate::app::tests::app;
     use crate::app::{HelpMenu, HelpTab};
     use crate::article::ArticleId;
-    use crate::images::Subject;
+    use crate::images::{Key, Subject};
     use ratatui_image::picker::ProtocolType;
 
     /// A screen of text in the theme's colors, with a kitty picture's
@@ -426,8 +426,12 @@ mod tests {
         let mut buf = drawn(app, PICTURE);
         let as_drawn = buf.clone();
         app.images.placed.clear();
-        let id = ArticleId::of("https://e.vn/a");
-        app.images.place(&Subject::Article(id), PICTURE, PICTURE);
+        let key = Key {
+            subject: Subject::Article(ArticleId::of("https://e.vn/a")),
+            cols: PICTURE.width,
+            rows: PICTURE.height,
+        };
+        app.images.place(&key, PICTURE, PICTURE, &mut buf);
         app.help = (!popups.is_empty()).then(|| HelpMenu::new(HelpTab::Keys));
         under(app, &mut buf, at);
         for &(popup, place) in popups {

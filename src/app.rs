@@ -549,6 +549,8 @@ impl App {
         quit_on_hangup(self.tx.clone())?;
         self.refresh_feeds(false);
         let mut result = Ok(());
+        // Drawing failed: nothing more is written to the terminal.
+        let mut failed = false;
         loop {
             if self.quit {
                 break;
@@ -556,14 +558,20 @@ impl App {
             // The frames of an animation come at a steady pace, counted from
             // when each began, not from when the one before ended.
             let frame_began = tokio::time::Instant::now();
+            // Before the frame, which may send pictures in their place.
+            self.send_deletions();
             // A frame that can't be drawn ends tuinews; when the tab was
             // closed (the hangup not read yet), it's a quit.
             if let Err(err) = terminal.draw(|frame| crate::ui::draw(frame, self)) {
+                failed = true;
                 if !crate::screen::gone() {
                     result = Err(err.into());
                 }
                 break;
             }
+            // What the frame sent pictures with, after it (`Images::place`):
+            // their placeholders on screen show them once they're in.
+            write_to_terminal(&self.images.take_transmits());
             write_to_terminal(&self.video_placement());
             self.images.fetch();
             tokio::select! {
@@ -605,7 +613,18 @@ impl App {
         }
         self.stop_video();
         write_to_terminal(&self.video_placement());
+        // The terminal would keep the pictures after tuinews is gone.
+        self.images.drop_all();
+        if !failed {
+            self.send_deletions();
+        }
         result
+    }
+
+    /// Has a terminal speaking kitty's protocol delete the pictures dropped
+    /// since it was last told (`Images::deletions`).
+    fn send_deletions(&self) {
+        write_to_terminal(&self.images.deletions());
     }
 
     /// What to tell Pepper after a frame: where the video playing inside it
@@ -2596,7 +2615,8 @@ fn open_url(url: &str) -> std::io::Result<()> {
 
 /// Writes escape sequences tuinews makes itself to the terminal, between
 /// frames: Pepper's (`pepper::place`, `pepper::remove`), only ever a token
-/// and numbers.
+/// and numbers, and kitty's sending and deleting pictures
+/// (`Images::take_transmits`, `Images::deletions`).
 fn write_to_terminal(sequences: &str) {
     use std::io::Write;
     if sequences.is_empty() {

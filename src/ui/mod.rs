@@ -1276,6 +1276,51 @@ mod tests {
     }
 
     #[test]
+    fn kitty_pictures_first_drawn_under_the_reader_or_a_popup_still_come() {
+        let mut app = app();
+        app.settings.full_text = false;
+        app.images
+            .set_protocol(ratatui_image::picker::ProtocolType::Kitty);
+        app.focus = Focus::Grid;
+        app.on_key(key(KeyCode::Enter));
+        let reader = app.reader.as_mut().unwrap();
+        reader.body = crate::app::Body::Text(vec![
+            crate::html::Block::Paragraph("Đoạn đầu.".into()),
+            crate::html::Block::Picture("https://i1-vnexpress.vnecdn.net/trong-bai.jpg".into()),
+        ]);
+        app.confirm = Some(Confirm::MarkAllRead(Vec::new()));
+        let frame = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(150, 50)).unwrap();
+            terminal.draw(|f| draw(f, app)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        frame(&mut app);
+        let blank = image::DynamicImage::new_rgb8(160, 90);
+        app.images.build_wanted_now(&blank);
+        let shown = frame(&mut app);
+        // The cards behind the reader, its own picture and the one in its
+        // text, the question over them: each is sent once, after the frame.
+        let drawn = app.images.placed.len();
+        assert!(drawn >= 5, "{drawn}");
+        let sent = app.images.take_transmits();
+        assert_eq!(sent.matches("a=T").count(), drawn);
+        assert!(shown.content().iter().all(|c| !c.symbol().contains('\x1b')));
+        // Though the reader covers the cells they'd have been sent from.
+        let covered = app.images.placed.iter().filter(|p| {
+            !shown[p.shown.as_position()]
+                .symbol()
+                .starts_with('\u{10EEEE}')
+        });
+        assert!(covered.count() >= 2, "cards' under the reader's words");
+        frame(&mut app);
+        assert_eq!(app.images.take_transmits(), "", "sent already");
+        app.confirm = None;
+        app.on_key(key(KeyCode::Esc));
+        frame(&mut app);
+        assert_eq!(app.images.take_transmits(), "", "nor once they show");
+    }
+
+    #[test]
     fn a_video_shows_as_its_poster_with_what_enter_does() {
         let mut app = app();
         let video = crate::app::tests::reading_a_video(&mut app);

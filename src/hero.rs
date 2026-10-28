@@ -386,9 +386,10 @@ async fn export_hero_screen() {
     for y in 0..rows {
         for x in 0..cols {
             let cell = &buffer[(x, y)];
-            // Kitty's picture cells hold its escape codes and placeholders:
-            // hero.py paints the picture there.
-            let picture = cell.symbol().contains(['\u{1b}', '\u{10EEEE}']);
+            // Kitty's picture cells hold its placeholders (`Images::place`
+            // took out the code that sends it): hero.py paints the picture
+            // there.
+            let picture = cell.symbol().contains('\u{10EEEE}');
             let symbol = if picture { " " } else { cell.symbol() };
             cells.push(format!(
                 "[{}, {}, {}, {}]",

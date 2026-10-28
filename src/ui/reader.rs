@@ -566,7 +566,7 @@ fn draw_pictures(
                 y: top as i16,
             };
             frame.render_widget(SlicedImage::new(image, at), area);
-            app.images.place(&placed.subject, whole, shown);
+            app.images.place(&key, whole, shown, frame.buffer_mut());
             continue;
         }
         frame.render_widget(Block::new().style(Style::new().bg(c.selected)), shown);
