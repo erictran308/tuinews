@@ -1,6 +1,6 @@
 [package]
 name = "tuinews"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "The news in your terminal: a vim-style RSS reader with a sidebar of sources and a grid of article cards"
 license = "MIT"
